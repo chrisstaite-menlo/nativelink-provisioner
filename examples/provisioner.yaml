@@ -1,0 +1,389 @@
+apiVersion: v1
+data:
+  config.json: |-
+    {
+      "redis_address": "redis://dev-1-redis-headless:26379/0?sentinelServiceName=mymaster",
+      "pub_sub_channel": "scheduler_key_change",
+      "prometheus_url": "http://dev-1-nativelink-prom-frontend:9090",
+      "poll_frequency": "60s",
+      "minimum_age": "120s",
+      "max_pods": 16,
+      "queue_per_pod": 64
+    }
+  worker-spec.json: |-
+    {
+      "kind": "Pod",
+      "metadata": {
+        "name": "worker",
+        "labels": {
+          "app.kubernetes.io/component": "worker",
+          "app.kubernetes.io/name": "nativelink",
+          "app.kubernetes.io/instance": "dev-1"
+        }
+      },
+      "spec": {
+        "serviceAccountName": "nativelink",
+        "initContainers": [
+          {
+            "name": "nativelink-worker-init",
+            "args": ["/shared/nativelink"],
+            "image": "ghcr.io/tracemachina/nativelink-worker-init:hdxrp9xrc8q35hzf21nafksw7pqk59fj",
+            "imagePullPolicy": "IfNotPresent",
+            "resources": {
+              "requests": {
+                "cpu": "50m",
+                "memory": "100Mi"
+              },
+              "limits": {
+                "cpu": "1",
+                "memory": "1Gi"
+              }
+            },
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": ["ALL"]
+              },
+              "privileged": false,
+              "readOnlyRootFilesystem": false,
+              "runAsGroup": 1000,
+              "runAsUser": 1000,
+              "runAsNonRoot": true,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "volumeMounts": [
+              {
+                "mountPath": "/shared",
+                "name": "shared"
+              }
+            ]
+          }
+        ],
+        "containers": [
+          {
+            "name": "worker",
+            "image": "FILLED_BY_SCALER",
+            "imagePullPolicy": "IfNotPresent",
+            "securityContext": {
+              "allowPrivilegeEscalation": false,
+              "capabilities": {
+                "drop": ["ALL"]
+              },
+              "privileged": false,
+              "readOnlyRootFilesystem": false,
+              "runAsGroup": 1000,
+              "runAsUser": 1000,
+              "runAsNonRoot": true,
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "args": ["/etc/config/worker.json"],
+            "command": ["/shared/nativelink"],
+            "env": [
+              {
+                "name": "PP_CONTAINER_IMAGE",
+                "value": "FILLED_BY_SCALER"
+              },
+              {
+                "name": "RUST_LOG",
+                "value": "info"
+              },
+              {
+                "name": "CAS_ENDPOINT",
+                "value": "dev-1-nativelink-cas"
+              },
+              {
+                "name": "SCHEDULER_ENDPOINT",
+                "value": "dev-1-nativelink-cas"
+              },
+              {
+                "name": "PP_OS_FAMILY",
+                "value": "Linux"
+              },
+              {
+                "name": "PP_CPU",
+                "value": "16000"
+              },
+              {
+                "name": "NL_LOG",
+                "value": "json"
+              },
+              {
+                "name": "NATIVE_LINK_GCP_CAS_BUCKET",
+                "value": "rbe-dev-storage"
+              }
+            ],
+            "envFrom": [
+              {
+                "configMapRef": {
+                  "name": "dev-1-nativelink-redis-env"
+                }
+              }
+            ],
+            "resources": {
+              "requests": {
+                "cpu": "16",
+                "memory": "21Gi",
+                "ephemeral-storage": "1Gi"
+              },
+              "limits": {
+                "cpu": "17",
+                "memory": "24Gi",
+                "ephemeral-storage": "1Gi"
+              }
+            },
+            "volumeMounts": [
+              {
+                "mountPath": "/shared",
+                "name": "shared"
+              },
+              {
+                "mountPath": "/etc/config",
+                "name": "config-json"
+              },
+              {
+                "mountPath": "/etc/ssl/certs",
+                "name": "ca-certs"
+              },
+              {
+                "mountPath": "/tmp/nativelink",
+                "name": "work-volume"
+              }
+            ]
+          }
+        ],
+        "volumes": [
+          {
+            "name": "ca-certs",
+            "secret": {
+              "secretName": "ca-certs",
+              "items": [
+                {
+                  "key": "ca-certificates.crt",
+                  "path": "ca-certificates.crt"
+                }
+              ]
+            }
+          },
+          {
+            "name": "shared",
+            "emptyDir": {}
+          },
+          {
+            "name": "config-json",
+            "configMap": {
+              "defaultMode": 420,
+              "name": "default-worker-config"
+            }
+          },
+          {
+            "name": "work-volume",
+            "emptyDir": {
+              "medium": "Memory",
+              "sizeLimit": "6Gi"
+            }
+          }
+        ],
+        "nodeSelector": {
+          "kubernetes.io/arch": "amd64",
+          "kubernetes.io/os": "linux"
+        }
+      }
+    }
+kind: ConfigMap
+metadata:
+  name: autoscaler-config
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: worker-provisioner
+    app.kubernetes.io/name: nativelink
+    app.kubernetes.io/instance: "dev-1"
+  name: dev-1-nativelink-worker-provisioner
+spec:
+  progressDeadlineSeconds: 600
+  replicas: 1
+  revisionHistoryLimit: 10
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: worker-provisioner
+      app.kubernetes.io/name: nativelink
+      app.kubernetes.io/instance: "dev-1"
+  strategy:
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: worker-provisioner
+        app.kubernetes.io/name: nativelink
+        app.kubernetes.io/instance: "dev-1"
+    spec:
+      nodeSelector:
+        kubernetes.io/arch: amd64
+        kubernetes.io/os: linux
+      affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app.kubernetes.io/name
+                      operator: In
+                      values:
+                        - nativelink
+                topologyKey: topology.kubernetes.io/zone
+              weight: 100
+      containers:
+        - env:
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.namespace
+            - name: CONFIG_PATH
+              value: /app/config/config.json
+            - name: WORKER_SPEC_PATH
+              value: /app/config/worker-spec.json
+          envFrom:
+            - configMapRef:
+                name: dev-1-nativelink-redis-env
+                optional: false
+          image: nativelink-provisioner:0.1.0
+          imagePullPolicy: Always
+          name: worker-provisioner
+          resources:
+            limits:
+              cpu: 100m
+              memory: 200Mi
+            requests:
+              cpu: 40m
+              memory: 100Mi
+          securityContext:
+            capabilities:
+              drop:
+              - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+          volumeMounts:
+            - mountPath: /app/config
+              name: autoscaler-config
+      dnsPolicy: ClusterFirst
+      restartPolicy: Always
+      securityContext: {}
+      serviceAccount: nativelink
+      serviceAccountName: nativelink
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - configMap:
+            defaultMode: 420
+            name: autoscaler-config
+          name: autoscaler-config
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: worker-provisioner-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - kind: ServiceAccount
+    name: nativelink
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dev-1-nativelink-prom-frontend
+  labels:
+    app.kubernetes.io/name: nativelink
+    app.kubernetes.io/instance: dev-1
+spec:
+  type: ClusterIP
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+      protocol: TCP
+  selector:
+    app.kubernetes.io/component: metrics-frontend
+    app.kubernetes.io/name: nativelink
+    app.kubernetes.io/instance: dev-1
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/component: metrics-frontend
+    app.kubernetes.io/name: nativelink
+    app.kubernetes.io/instance: dev-1
+  name: dev-1-nativelink-prom-frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: metrics-frontend
+      app.kubernetes.io/name: nativelink
+      app.kubernetes.io/instance: dev-1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: metrics-frontend
+        app.kubernetes.io/name: nativelink
+        app.kubernetes.io/instance: dev-1
+    spec:
+      automountServiceAccountToken: true
+      serviceAccount: nativelink
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: kubernetes.io/arch
+                operator: In
+                values:
+                - arm64
+                - amd64
+              - key: kubernetes.io/os
+                operator: In
+                values:
+                - linux
+      containers:
+      - name: dev-1-nativelink-prom-frontend
+        image: gke.gcr.io/prometheus-engine/frontend:v0.15.3-gke.0
+        args:
+        - "--web.listen-address=:9090"
+        - "--query.project-id=<PROJECT_ID>"
+        ports:
+        - name: web
+          containerPort: 9090
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: web
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - all
+          privileged: false
+          runAsGroup: 1000
+          runAsNonRoot: true
+          runAsUser: 1000
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: web
