@@ -39,16 +39,12 @@ pub(crate) fn monitor_workers(
 ) -> Receiver<HashSet<WorkerName>> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
-        let mut idle_workers = HashSet::new();
         loop {
             tokio::select! {
                 _ = tx.closed() => return,
-                maybe_new_idle_workers = get_idle_workers(&client, &namespace) => {
-                    if let Some(new_idle_workers) = maybe_new_idle_workers {
-                        if new_idle_workers != idle_workers {
-                            let _ = tx.send(new_idle_workers.clone()).await;
-                            idle_workers = new_idle_workers;
-                        }
+                maybe_idle_workers = get_idle_workers(&client, &namespace) => {
+                    if let Some(idle_workers) = maybe_idle_workers {
+                        let _ = tx.send(idle_workers).await;
                     }
                 }
             }

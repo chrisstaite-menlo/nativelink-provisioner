@@ -4,6 +4,7 @@ use std::fs::File;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::{EnvVar, Pod};
 use kube::api::{Api, ListParams, PostParams};
 use kube::{Client, ResourceExt};
@@ -71,16 +72,7 @@ impl ScaleInfo {
         let minimum_uptime = *start_time + self.minimum_age;
         let now = Instant::now();
         let required_workers = self.required_workers(queue_size);
-        let decision = minimum_uptime < now && required_workers < current_workers;
-        tracing::info!(
-            minimum_uptime = ?minimum_uptime,
-            now = ?now,
-            required_workers = required_workers,
-            current_workers = current_workers,
-            decision = decision,
-            "Should scale down?"
-        );
-        decision
+        minimum_uptime < now && required_workers < current_workers
     }
 }
 
@@ -120,128 +112,160 @@ async fn get_worker_pods(
         .collect()
 }
 
-async fn maybe_scale_up(
-    scale_info: &ScaleInfo,
-    properties: action_info::PropertySet,
-    queue_size: usize,
-    pods: &Api<Pod>,
-    pod_spec: &Pod,
-    workers: &'_ mut WorkerMap,
-) {
-    let mut workers_entry = match workers.entry(properties.clone()) {
-        std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
-            occupied_entry.get_mut().0 = queue_size;
-            occupied_entry
-        }
-        std::collections::hash_map::Entry::Vacant(vacant_entry) => {
-            let workers = get_worker_pods(pods, vacant_entry.key()).await;
-            vacant_entry.insert_entry((queue_size, workers))
-        }
-    };
-    let running_workers = &mut workers_entry.get_mut().1;
-
-    if !scale_info.should_scale_up(running_workers.len(), queue_size) {
-        // No need to scale up.
-        return;
-    }
-
-    // Scale up workers.
-    let mut spawn_pod_spec = pod_spec.clone();
-    if let Some(image_name) = properties.get(CONTAINER_IMAGE_PROPERTY) {
-        if let Some(image) = image_name.strip_prefix(DOCKER_IMAGE_PREFIX) {
-            if let Some(spec) = &mut spawn_pod_spec.spec {
-                for container in &mut spec.containers {
-                    container.image = Some(image.to_string());
-                    let mut found = false;
-                    for env in container.env.get_or_insert_default() {
-                        if env.name == CONTAINER_PROPERTY_ENVIRONMENT_NAME {
-                            env.value = Some(image_name.clone());
-                            env.value_from = None;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
-                        container.env.as_mut().unwrap().push(EnvVar {
-                            name: CONTAINER_PROPERTY_ENVIRONMENT_NAME.to_string(),
-                            value: Some(image_name.clone()),
-                            value_from: None,
-                        });
-                    }
-                }
-            } else {
-                tracing::warn!("No Pod spec found to set environment in");
-            }
-
-            // Create a unique name for this pod.
-            spawn_pod_spec.metadata.name = Some(format!(
-                "{}-{}",
-                spawn_pod_spec
-                    .metadata
-                    .name
-                    .as_ref()
-                    .map_or("worker", |name| name.as_str()),
-                uuid::Uuid::new_v4()
-            ));
-
-            tracing::info!(
-                queue = queue_size,
-                workers = running_workers.len(),
-                properties = ?properties,
-                "Scaling up a new worker for {image_name}"
-            );
-            let pp = PostParams::default();
-            match pods.create(&pp, &spawn_pod_spec).await {
-                Ok(pod) => {
-                    let pod_name = pod.name_any();
-                    running_workers.insert(pod_name, Instant::now());
-                    tracing::info!(workers=?workers, "Scaled up new worker");
-                }
-                Err(err) => tracing::error!(err=?err, "There was an error creating a container"),
-            }
-        } else {
-            tracing::error!(
-                image_name = image_name,
-                "Not scaling up because no {DOCKER_IMAGE_PREFIX} prefix"
-            );
-        }
-    } else {
-        tracing::error!(properties=?properties, "Not scaling up because no {CONTAINER_IMAGE_PROPERTY} property");
-    }
+struct WorkerManager {
+    scale_info: ScaleInfo,
+    pods: Api<Pod>,
+    pod_spec: Pod,
+    workers: WorkerMap,
 }
 
-async fn maybe_scale_down(
-    scale_info: &ScaleInfo,
-    idle_workers: HashSet<worker_monitor::WorkerName>,
-    workers: &mut WorkerMap,
-    pods: &Api<Pod>,
-) {
-    for idle_worker_name in idle_workers {
-        for (_key, (queue_size, worker_names)) in workers.iter_mut() {
-            let Some((name, start_time)) = worker_names.remove_entry(&idle_worker_name) else {
-                // Worker isn't for this property set, carry on.
-                continue;
-            };
-
-            // Leave workers if they're still required for the queue.
-            if !scale_info.should_scale_down(&start_time, worker_names.len() + 1, *queue_size) {
-                worker_names.insert(name, start_time);
-                continue;
+impl WorkerManager {
+    async fn maybe_scale_up(&mut self, properties: action_info::PropertySet, queue_size: usize) {
+        let mut workers_entry = match self.workers.entry(properties.clone()) {
+            std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
+                occupied_entry.get_mut().0 = queue_size;
+                occupied_entry
             }
+            std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                let workers = get_worker_pods(&self.pods, vacant_entry.key()).await;
+                vacant_entry.insert_entry((queue_size, workers))
+            }
+        };
+        let running_workers = &mut workers_entry.get_mut().1;
 
-            // Try to delete the worker.
-            tracing::info!(
-                queue = *queue_size,
-                workers = worker_names.len() + 1,
-                "Scaling down worker {idle_worker_name}"
-            );
-            if let Err(err) = pods.delete(&name, &Default::default()).await {
-                tracing::error!(err=?err, "There was an error deleting a container");
-                worker_names.insert(name, start_time);
+        if !self
+            .scale_info
+            .should_scale_up(running_workers.len(), queue_size)
+        {
+            // No need to scale up.
+            return;
+        }
+
+        // Scale up workers.
+        let mut spawn_pod_spec = self.pod_spec.clone();
+        if let Some(image_name) = properties.get(CONTAINER_IMAGE_PROPERTY) {
+            if let Some(image) = image_name.strip_prefix(DOCKER_IMAGE_PREFIX) {
+                if let Some(spec) = &mut spawn_pod_spec.spec {
+                    for container in &mut spec.containers {
+                        container.image = Some(image.to_string());
+                        let mut found = false;
+                        for env in container.env.get_or_insert_default() {
+                            if env.name == CONTAINER_PROPERTY_ENVIRONMENT_NAME {
+                                env.value = Some(image_name.clone());
+                                env.value_from = None;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            container.env.as_mut().unwrap().push(EnvVar {
+                                name: CONTAINER_PROPERTY_ENVIRONMENT_NAME.to_string(),
+                                value: Some(image_name.clone()),
+                                value_from: None,
+                            });
+                        }
+                    }
+                } else {
+                    tracing::warn!("No Pod spec found to set environment in");
+                }
+
+                // Create a unique name for this pod.
+                spawn_pod_spec.metadata.name = Some(format!(
+                    "{}-{}",
+                    spawn_pod_spec
+                        .metadata
+                        .name
+                        .as_ref()
+                        .map_or("worker", |name| name.as_str()),
+                    uuid::Uuid::new_v4()
+                ));
+
+                tracing::info!(
+                    queue = queue_size,
+                    workers = running_workers.len(),
+                    properties = ?properties,
+                    "Scaling up a new worker for {image_name}"
+                );
+                let pp = PostParams::default();
+                match self.pods.create(&pp, &spawn_pod_spec).await {
+                    Ok(pod) => {
+                        let pod_name = pod.name_any();
+                        running_workers.insert(pod_name, Instant::now());
+                        tracing::info!(workers=?self.workers, "Scaled up new worker");
+                    }
+                    Err(err) => {
+                        tracing::error!(err=?err, "There was an error creating a container")
+                    }
+                }
             } else {
-                // Workers are unique to each property set, so exit the loop.
+                tracing::error!(
+                    image_name = image_name,
+                    "Not scaling up because no {DOCKER_IMAGE_PREFIX} prefix"
+                );
+            }
+        } else {
+            tracing::error!(properties=?properties, "Not scaling up because no {CONTAINER_IMAGE_PROPERTY} property");
+        }
+    }
+
+    async fn maybe_scale_down(&mut self, idle_workers: HashSet<worker_monitor::WorkerName>) {
+        for idle_worker_name in idle_workers {
+            for (_key, (queue_size, worker_names)) in self.workers.iter_mut() {
+                let Some((name, start_time)) = worker_names.remove_entry(&idle_worker_name) else {
+                    // Worker isn't for this property set, carry on.
+                    continue;
+                };
+
+                // Leave workers if they're still required for the queue.
+                if !self.scale_info.should_scale_down(
+                    &start_time,
+                    worker_names.len() + 1,
+                    *queue_size,
+                ) {
+                    worker_names.insert(name, start_time);
+                    continue;
+                }
+
+                // Try to delete the worker.
+                tracing::info!(
+                    queue = *queue_size,
+                    workers = worker_names.len() + 1,
+                    "Scaling down worker {idle_worker_name}"
+                );
+                if let Err(err) = self.pods.delete(&name, &Default::default()).await {
+                    tracing::error!(err=?err, "There was an error deleting a container");
+                    worker_names.insert(name, start_time);
+                } else {
+                    // Workers are unique to each property set, so exit the loop.
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn handle_pod_notification(&mut self, pod: Pod) {
+        let Some(status) = &pod.status else {
+            return;
+        };
+        if status
+            .phase
+            .as_ref()
+            .is_some_and(|phase| phase == "Running" || phase == "Pending")
+        {
+            return;
+        }
+        let pod_name = pod.name_any();
+        let mut deleted = None;
+        for (properties, (queue_size, worker_names)) in self.workers.iter_mut() {
+            if worker_names.remove(&pod_name).is_some() {
+                tracing::info!(phase = status.phase, "Worker stopped running: {}", pod_name);
+                let _ = self.pods.delete(&pod_name, &Default::default()).await;
+                deleted = Some((properties.clone(), *queue_size));
                 break;
             }
+        }
+        if let Some((properties, queue_size)) = deleted {
+            self.maybe_scale_up(properties, queue_size).await;
         }
     }
 }
@@ -278,8 +302,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vec![CONTAINER_IMAGE_PROPERTY.to_string()],
     )?;
 
-    // Find the number of active workers for each property set.
-    let mut workers: WorkerMap = HashMap::new();
+    // A watcher for workers that have become unhealthy (crashed or OOMd).
+    let watcher_config = kube::runtime::watcher::Config::default();
+    let mut watcher = std::pin::pin!(kube::runtime::watcher(pods.clone(), watcher_config));
 
     // A background task to monitor for idle workers and scale them down.
     let mut idle_worker =
@@ -294,21 +319,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for there to be a queue or an idle worker.
     tracing::info!("Monitoring queue to scale workers");
+    let mut manager = WorkerManager {
+        scale_info,
+        pods,
+        pod_spec,
+        workers: WorkerMap::new(),
+    };
     loop {
         tokio::select! {
+            maybe_pod_change = watcher.next() => {
+                let Some(Ok(change)) = maybe_pod_change else {
+                    tracing::error!("Error watching for pod changes");
+                    break;
+                };
+                match change {
+                    kube::runtime::watcher::Event::InitApply(pod) | kube::runtime::watcher::Event::Apply(pod) | kube::runtime::watcher::Event::Delete(pod) => {
+                        manager.handle_pod_notification(pod).await;
+                    }
+                    kube::runtime::watcher::Event::Init | kube::runtime::watcher::Event::InitDone => (),
+                }
+            }
             idle_workers = idle_worker.recv() => {
                 let Some(idle_workers) = idle_workers else {
                     tracing::error!("Idle worker check failed");
                     break;
                 };
-                maybe_scale_down(&scale_info, idle_workers, &mut workers, &pods).await;
+                manager.maybe_scale_down(idle_workers).await;
             }
             worker_queue = operations_change.recv() => {
                 let Some((properties, queue_size)) = worker_queue else {
                     tracing::error!("Worker queue check failed");
                     break;
                 };
-                maybe_scale_up(&scale_info, properties, queue_size, &pods, &pod_spec, &mut workers).await;
+                manager.maybe_scale_up(properties, queue_size).await;
             }
         }
     }
