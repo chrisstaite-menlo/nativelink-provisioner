@@ -273,6 +273,11 @@ impl WorkerManager {
                     worker_names.len() + 1,
                     *queue_size,
                 ) {
+                    tracing::info!(
+                        queue_size = *queue_size,
+                        workers = worker_names.len() + 1,
+                        "Not scaling down worker {name} yet."
+                    );
                     worker_names.insert(name, start_time);
                     continue;
                 }

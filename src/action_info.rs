@@ -75,6 +75,10 @@ fn monitor_changes(
                 continue;
             }
             let mut reconnect_rx = subscriber_client.reconnect_rx();
+            // Notify that we've connected to get initial operation scan.
+            if tx.send(String::new()).await.is_err() {
+                return;
+            }
             loop {
                 let maybe_operation_id = tokio::select! {
                     _ = tx.closed() => {
@@ -304,14 +308,7 @@ fn operation_manager(
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let group_by = HashSet::from_iter(group_by);
     tokio::spawn(async move {
-        let mut active_operations = list_operations(&redis_client, &group_by).await;
-        // Initial update for all operations.
-        for (properties, (queued, _running)) in &active_operations {
-            let queued_entries = queued.len();
-            if queued_entries > 0 && tx.send((properties.clone(), queued_entries)).await.is_err() {
-                return;
-            }
-        }
+        let mut active_operations = HashMap::new();
         loop {
             tokio::select! {
                 _ = tx.closed() => {
@@ -321,6 +318,17 @@ fn operation_manager(
                     let Some(operation_id) = operation_id else {
                         return;
                     };
+                    if operation_id.is_empty() {
+                        // Initial update for all operations.
+                        active_operations = list_operations(&redis_client, &group_by).await;
+                        for (properties, (queued, _running)) in &active_operations {
+                            let queued_entries = queued.len();
+                            if queued_entries > 0 && tx.send((properties.clone(), queued_entries)).await.is_err() {
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     let Some(operation) = get_operation(&redis_client, &group_by, &operation_id).await else {
                         continue;
                     };
