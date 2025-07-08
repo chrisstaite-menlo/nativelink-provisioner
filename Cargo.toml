@@ -38,3 +38,5 @@ uuid = { version = "1.16.0", default-features = false, features = [
   "v4",
   "v6",
 ] }
+notify = "6.1.1"
+notify-debouncer-full = "0.3.1"

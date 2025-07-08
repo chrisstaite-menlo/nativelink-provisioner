@@ -9,7 +9,7 @@ pub(crate) type WorkerName = String;
 /// Queries prometheus to find workers that have been idle for a certain period.
 async fn get_idle_workers(client: &Client, namespace: &str) -> Option<HashSet<WorkerName>> {
     let query = format!(
-        r#"rate(container_cpu_usage_seconds_total{{namespace="{namespace}"}} [1m]) < 0.7"#
+        r#"rate(container_cpu_usage_seconds_total{{namespace="{namespace}", container="worker"}} [1m]) < 0.7"#
     );
 
     let response = match client.query(query).get().await {

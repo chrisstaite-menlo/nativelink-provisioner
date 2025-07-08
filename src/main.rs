@@ -2,13 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::File;
 use std::num::NonZeroUsize;
+use std::path::Path;
+use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use k8s_openapi::api::core::v1::{EnvVar, Pod};
 use kube::api::{Api, ListParams, PostParams};
+use kube::runtime::watcher::Event;
 use kube::{Client, ResourceExt};
+use notify::{RecursiveMode, Watcher};
+use notify_debouncer_full::{DebounceEventResult, new_debouncer};
 use serde::Deserialize;
+use tokio::sync::mpsc::Receiver;
 
 mod action_info;
 mod worker_monitor;
@@ -113,13 +119,58 @@ async fn get_worker_pods(
 }
 
 struct WorkerManager {
+    namespace: String,
     scale_info: ScaleInfo,
     pods: Api<Pod>,
     pod_spec: Pod,
     workers: WorkerMap,
+    idle_worker: Receiver<HashSet<String>>,
+    operations_change: Receiver<(action_info::PropertySet, action_info::OperationCount)>,
+    watcher: Pin<Box<dyn Stream<Item = kube::runtime::watcher::Result<Event<Pod>>>>>,
 }
 
 impl WorkerManager {
+    fn new(
+        kube_client: Client,
+        config: Config,
+        pod_spec: Pod,
+        namespace: String,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Set up the auto-scaler limits.
+        let scale_info = ScaleInfo {
+            max_pods: config.max_pods,
+            queue_per_pod: config.queue_per_pod,
+            minimum_age: config.minimum_age,
+        };
+        // Read pods in the configured namespace into the typed interface from k8s-openapi
+        let pods: Api<Pod> = Api::namespaced(kube_client, &namespace);
+
+        // A background task to monitor for idle workers and scale them down.
+        let prom_client = prometheus_http_query::Client::try_from(config.prometheus_url.as_str())?;
+        let idle_worker =
+            worker_monitor::monitor_workers(prom_client, namespace.clone(), config.poll_frequency);
+
+        // Monitor for operations in the Redis scheduler.
+        let operations_change = action_info::monitor_operations(
+            &config.redis_address,
+            config.pub_sub_channel,
+            vec![CONTAINER_IMAGE_PROPERTY.to_string()],
+        )?;
+
+        let watcher = Box::pin(kube::runtime::watcher(pods.clone(), Default::default()));
+
+        Ok(Self {
+            namespace,
+            scale_info,
+            pods,
+            pod_spec,
+            workers: WorkerMap::new(),
+            idle_worker,
+            operations_change,
+            watcher,
+        })
+    }
+
     async fn maybe_scale_up(&mut self, properties: action_info::PropertySet, queue_size: usize) {
         let mut workers_entry = match self.workers.entry(properties.clone()) {
             std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
@@ -275,59 +326,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let config_path = env::var("CONFIG_PATH").unwrap_or("config.json".to_string());
-    let file = File::open(config_path)?;
-    let config: Config = serde_json::from_reader(file)?;
-    let namespace = match config.namespace {
-        Some(namespace) => namespace,
+    let config: Config = serde_json::from_reader(File::open(&config_path)?)?;
+    let namespace = match &config.namespace {
+        Some(namespace) => namespace.clone(),
         None => env::var("K8S_NAMESPACE")?,
     };
 
     let spec_path = env::var("WORKER_SPEC_PATH").unwrap_or("worker-spec.json".to_string());
-    let file = File::open(spec_path)?;
-    let pod_spec: Pod = serde_json::from_reader(file)?;
+    let pod_spec: Pod = serde_json::from_reader(File::open(&spec_path)?)?;
 
-    // Get a client to determine the use of the workers.
-    let prom_client = prometheus_http_query::Client::try_from(config.prometheus_url.as_str())?;
+    // Configuration re-load.
+    let (tx, mut config_changed) = tokio::sync::mpsc::channel(1);
+    let rt = tokio::runtime::Handle::current();
+    let mut debouncer = new_debouncer(
+        Duration::from_secs(2),
+        None,
+        move |result: DebounceEventResult| {
+            let tx = tx.clone();
+            rt.spawn(async move {
+                let _ = tx.send(result).await;
+            });
+        },
+    )?;
+    debouncer
+        .watcher()
+        .watch(Path::new(&spec_path), RecursiveMode::NonRecursive)?;
+    debouncer
+        .watcher()
+        .watch(Path::new(&config_path), RecursiveMode::NonRecursive)?;
 
     // Infer the runtime environment and try to create a Kubernetes Client
     let kube_client = Client::try_default().await?;
 
-    // Read pods in the configured namespace into the typed interface from k8s-openapi
-    let pods: Api<Pod> = Api::namespaced(kube_client, &namespace);
-
-    // Monitor for operations in the Redis scheduler.
-    let mut operations_change = action_info::monitor_operations(
-        &config.redis_address,
-        config.pub_sub_channel,
-        vec![CONTAINER_IMAGE_PROPERTY.to_string()],
-    )?;
-
-    // A watcher for workers that have become unhealthy (crashed or OOMd).
-    let watcher_config = kube::runtime::watcher::Config::default();
-    let mut watcher = std::pin::pin!(kube::runtime::watcher(pods.clone(), watcher_config));
-
-    // A background task to monitor for idle workers and scale them down.
-    let mut idle_worker =
-        worker_monitor::monitor_workers(prom_client, namespace, config.poll_frequency);
-
-    // Set up the auto-scaler limits.
-    let scale_info = ScaleInfo {
-        max_pods: config.max_pods,
-        queue_per_pod: config.queue_per_pod,
-        minimum_age: config.minimum_age,
-    };
-
     // Wait for there to be a queue or an idle worker.
     tracing::info!("Monitoring queue to scale workers");
-    let mut manager = WorkerManager {
-        scale_info,
-        pods,
-        pod_spec,
-        workers: WorkerMap::new(),
-    };
+    let mut manager = WorkerManager::new(kube_client.clone(), config, pod_spec, namespace)?;
     loop {
         tokio::select! {
-            maybe_pod_change = watcher.next() => {
+            maybe_changed_config = config_changed.recv() => {
+                let Some(Ok(_changed_config)) = maybe_changed_config else {
+                    tracing::error!("Config watcher exited");
+                    break;
+                };
+                // Reload the configuration.
+                if let Ok(file) = File::open(&config_path) {
+                    match serde_json::from_reader::<_, Config>(file) {
+                        Ok(new_config) => {
+                            let namespace = new_config.namespace.as_ref().unwrap_or(&manager.namespace).clone();
+                            match WorkerManager::new(kube_client.clone(), new_config, manager.pod_spec.clone(), namespace) {
+                                 Ok(new_manager) => manager = new_manager,
+                                 Err(err) => tracing::error!(err=?err, "New configuration error"),
+                            }
+                        }
+                        Err(err) => tracing::error!(err=?err, "Error re-loading configuration file"),
+                    }
+                }
+                if let Ok(file) = File::open(&spec_path) {
+                    match serde_json::from_reader(file) {
+                        Ok(new_pod_spec) => manager.pod_spec = new_pod_spec,
+                        Err(err) => tracing::error!(err=?err, "Error re-loading pod spec file"),
+                    }
+                }
+                tracing::info!("Configuration reload complete");
+            }
+            maybe_pod_change = manager.watcher.next() => {
                 let Some(Ok(change)) = maybe_pod_change else {
                     tracing::error!("Error watching for pod changes");
                     break;
@@ -339,14 +401,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     kube::runtime::watcher::Event::Init | kube::runtime::watcher::Event::InitDone => (),
                 }
             }
-            idle_workers = idle_worker.recv() => {
+            idle_workers = manager.idle_worker.recv() => {
                 let Some(idle_workers) = idle_workers else {
                     tracing::error!("Idle worker check failed");
                     break;
                 };
                 manager.maybe_scale_down(idle_workers).await;
             }
-            worker_queue = operations_change.recv() => {
+            worker_queue = manager.operations_change.recv() => {
                 let Some((properties, queue_size)) = worker_queue else {
                     tracing::error!("Worker queue check failed");
                     break;

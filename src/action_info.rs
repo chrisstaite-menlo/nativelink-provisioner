@@ -21,8 +21,8 @@ use tokio::sync::mpsc::Receiver;
 pub(crate) type PropertyName = String;
 pub(crate) type PropertyValue = String;
 pub(crate) type PropertySet = BTreeMap<PropertyName, PropertyValue>;
+pub(crate) type OperationCount = usize;
 type OperationId = String;
-type OperationCount = usize;
 
 /// The name of the field in the Redis hash that stores the data.
 const DATA_FIELD_NAME: &str = "data";
