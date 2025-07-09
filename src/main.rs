@@ -65,10 +65,6 @@ impl ScaleInfo {
         std::cmp::min(required_workers, self.max_pods)
     }
 
-    fn should_scale_up(&self, current_workers: usize, queue_size: usize) -> bool {
-        self.required_workers(queue_size) > current_workers
-    }
-
     fn should_scale_down(
         &self,
         start_time: &Instant,
@@ -130,7 +126,7 @@ struct WorkerManager {
 }
 
 impl WorkerManager {
-    fn new(
+    async fn new(
         kube_client: Client,
         config: Config,
         pod_spec: Pod,
@@ -155,7 +151,8 @@ impl WorkerManager {
             &config.redis_address,
             config.pub_sub_channel,
             vec![CONTAINER_IMAGE_PROPERTY.to_string()],
-        )?;
+        )
+        .await?;
 
         let watcher = Box::pin(kube::runtime::watcher(pods.clone(), Default::default()));
 
@@ -184,10 +181,9 @@ impl WorkerManager {
         };
         let running_workers = &mut workers_entry.get_mut().1;
 
-        if !self
-            .scale_info
-            .should_scale_up(running_workers.len(), queue_size)
-        {
+        let current_workers = running_workers.len();
+        let required_workers = self.scale_info.required_workers(queue_size);
+        if current_workers >= required_workers {
             // No need to scale up.
             return;
         }
@@ -220,34 +216,39 @@ impl WorkerManager {
                     tracing::warn!("No Pod spec found to set environment in");
                 }
 
-                // Create a unique name for this pod.
-                spawn_pod_spec.metadata.name = Some(format!(
-                    "{}-{}",
-                    spawn_pod_spec
-                        .metadata
-                        .name
-                        .as_ref()
-                        .map_or("worker", |name| name.as_str()),
-                    uuid::Uuid::new_v4()
-                ));
+                for _ in current_workers..required_workers {
+                    // Create a unique name for this pod.
+                    let mut this_pod = spawn_pod_spec.clone();
+                    this_pod.metadata.name = Some(format!(
+                        "{}-{}",
+                        spawn_pod_spec
+                            .metadata
+                            .name
+                            .as_ref()
+                            .map_or("worker", |name| name.as_str()),
+                        uuid::Uuid::new_v4()
+                    ));
 
-                tracing::info!(
-                    queue = queue_size,
-                    workers = running_workers.len(),
-                    properties = ?properties,
-                    "Scaling up a new worker for {image_name}"
-                );
-                let pp = PostParams::default();
-                match self.pods.create(&pp, &spawn_pod_spec).await {
-                    Ok(pod) => {
-                        let pod_name = pod.name_any();
-                        running_workers.insert(pod_name, Instant::now());
-                        tracing::info!(workers=?self.workers, "Scaled up new worker");
-                    }
-                    Err(err) => {
-                        tracing::error!(err=?err, "There was an error creating a container")
+                    tracing::info!(
+                        queue = queue_size,
+                        workers = running_workers.len(),
+                        properties = ?properties,
+                        "Scaling up a new worker for {image_name}"
+                    );
+                    let pp = PostParams::default();
+                    match self.pods.create(&pp, &this_pod).await {
+                        Ok(pod) => {
+                            let pod_name = pod.name_any();
+                            running_workers.insert(pod_name, Instant::now());
+                        }
+                        Err(err) => {
+                            tracing::error!(err=?err, "There was an error creating a container");
+                            break;
+                        }
                     }
                 }
+
+                tracing::info!(workers=?self.workers, "Scaled up new workers");
             } else {
                 tracing::error!(
                     image_name = image_name,
@@ -365,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait for there to be a queue or an idle worker.
     tracing::info!("Monitoring queue to scale workers");
-    let mut manager = WorkerManager::new(kube_client.clone(), config, pod_spec, namespace)?;
+    let mut manager = WorkerManager::new(kube_client.clone(), config, pod_spec, namespace).await?;
     loop {
         tokio::select! {
             maybe_changed_config = config_changed.recv() => {
@@ -378,7 +379,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     match serde_json::from_reader::<_, Config>(file) {
                         Ok(new_config) => {
                             let namespace = new_config.namespace.as_ref().unwrap_or(&manager.namespace).clone();
-                            match WorkerManager::new(kube_client.clone(), new_config, manager.pod_spec.clone(), namespace) {
+                            match WorkerManager::new(kube_client.clone(), new_config, manager.pod_spec.clone(), namespace).await {
                                  Ok(new_manager) => manager = new_manager,
                                  Err(err) => tracing::error!(err=?err, "New configuration error"),
                             }

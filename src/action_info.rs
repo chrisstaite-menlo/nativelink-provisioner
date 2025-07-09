@@ -1,20 +1,21 @@
 // This file monitors the Redis backend of a nativelink scheduler to determine
 // the number of jobs that are active for a given set of platform properties.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use bytes::Bytes;
 use fred::clients::{Pool, SubscriberClient};
-use fred::error::Error;
+use fred::error::{Error, ErrorKind};
 use fred::prelude::{
-    ClientLike, ConnectionConfig, EventInterface, HashesInterface, PerformanceConfig,
-    PubsubInterface, ReconnectPolicy,
+    Client, ClientLike, ConnectionConfig, EventInterface, HashesInterface, PerformanceConfig,
+    PubsubInterface, ReconnectPolicy, RediSearchInterface,
 };
 use fred::types::config::{Config, UnresponsiveConfig};
-use fred::types::scan::Scanner;
-use fred::types::{Builder, Key, Value};
-use futures::StreamExt;
+use fred::types::redisearch::{
+    AggregateOperation, FtAggregateOptions, Load, SearchField, WithCursor,
+};
+use fred::types::{Builder, FromValue, Key, Map, SortOrder, Value};
 use serde::Deserialize;
 use tokio::sync::mpsc::Receiver;
 
@@ -26,10 +27,12 @@ type OperationId = String;
 
 /// The name of the field in the Redis hash that stores the data.
 const DATA_FIELD_NAME: &str = "data";
+/// The name of the field in the Redis hash that stores the data.
+const VERSION_FIELD_NAME: &str = "version";
 /// The key prefix for an AwaitedAction in Redis.
 const AWAITED_ACTION_PREFIX: &str = "aa_";
 
-pub(crate) fn monitor_operations(
+pub(crate) async fn monitor_operations(
     redis_addr: &str,
     pub_sub_channel: String,
     group_by: Vec<PropertyName>,
@@ -58,7 +61,24 @@ pub(crate) fn monitor_operations(
     client_pool.connect();
     subscriber_client.connect();
     let operation_channel = monitor_changes(subscriber_client, pub_sub_channel);
-    Ok(operation_manager(client_pool, operation_channel, group_by))
+    let index_name = find_index(client_pool.next()).await?;
+    Ok(operation_manager(
+        client_pool,
+        operation_channel,
+        group_by,
+        index_name,
+    ))
+}
+
+async fn find_index(client: &Client) -> Result<String, Error> {
+    let index_list: Vec<String> = client.ft_list().await?;
+    index_list
+        .into_iter()
+        .find(|index| index.starts_with(&format!("{AWAITED_ACTION_PREFIX}_state_sort_key")))
+        .ok_or(Error::new(
+            fred::error::ErrorKind::InvalidCommand,
+            "No index found",
+        ))
 }
 
 fn monitor_changes(
@@ -125,13 +145,10 @@ fn monitor_changes(
 }
 
 type QueuedOperations = HashSet<OperationId>;
-type RunningOperations = HashSet<OperationId>;
-type ActiveOperations = HashMap<PropertySet, (QueuedOperations, RunningOperations)>;
-
+type ActiveOperations = HashMap<PropertySet, QueuedOperations>;
 
 #[derive(Deserialize)]
-struct ActionResult {
-}
+struct ActionResult {}
 
 #[derive(Deserialize)]
 enum ActionStage {
@@ -187,70 +204,121 @@ impl RedisOperationId {
     }
 }
 
+#[derive(Debug, Default)]
+struct RedisCursorData {
+    total: u64,
+    cursor: u64,
+    data: VecDeque<Map>,
+}
+
+impl FromValue for RedisCursorData {
+    fn from_value(value: Value) -> Result<Self, Error> {
+        if !value.is_array() {
+            return Err(Error::new(ErrorKind::Protocol, "Expected array"));
+        }
+        let mut output = Self::default();
+        let value = value.into_array();
+        if value.len() < 2 {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "Expected at least 2 elements",
+            ));
+        }
+        let mut value = value.into_iter();
+        let data_ary = value.next().unwrap().into_array();
+        if data_ary.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "Expected at least 1 element in data array",
+            ));
+        }
+        let Some(total) = data_ary[0].as_u64() else {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "Expected integer as first element",
+            ));
+        };
+        output.total = total;
+        output.data.reserve(data_ary.len() - 1);
+        for map_data in data_ary.into_iter().skip(1) {
+            output.data.push_back(map_data.into_map()?);
+        }
+        let Some(cursor) = value.next().unwrap().as_u64() else {
+            return Err(Error::new(
+                ErrorKind::Protocol,
+                "Expected integer as last element",
+            ));
+        };
+        output.cursor = cursor;
+        Ok(output)
+    }
+}
+
 async fn list_operations(
     redis_client: &Pool,
     group_by: &HashSet<PropertyName>,
+    index_name: &str,
 ) -> ActiveOperations {
     let mut active_operations = ActiveOperations::new();
     let client = redis_client.next();
 
-    // Scan for all keys starting with "aa_".
-    let mut scanner = client.scan(format!("{AWAITED_ACTION_PREFIX}*"), None, None);
+    let Ok(mut data): Result<RedisCursorData, _> = client
+        .ft_aggregate(
+            index_name,
+            "@state:{ queued }",
+            FtAggregateOptions {
+                load: Some(Load::Some(vec![
+                    SearchField {
+                        identifier: DATA_FIELD_NAME.into(),
+                        property: None,
+                    },
+                    SearchField {
+                        identifier: VERSION_FIELD_NAME.into(),
+                        property: None,
+                    },
+                ])),
+                cursor: Some(WithCursor {
+                    count: Some(256),
+                    max_idle: Some(2000),
+                }),
+                pipeline: vec![AggregateOperation::SortBy {
+                    properties: vec![("@sort_key".into(), SortOrder::Asc)],
+                    max: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+    else {
+        return active_operations;
+    };
 
-    let mut keys: Vec<Key> = Vec::new();
-    while let Some(chunk_result) = scanner.next().await {
-        match chunk_result {
-            Ok(mut chunk) => {
-                let Some(results) = chunk.take_results() else {
-                    continue;
+    loop {
+        while let Some(mut map) = data.data.pop_front() {
+            if let Some(data) = map
+                .remove(&Key::from_static_str(DATA_FIELD_NAME))
+                .and_then(|data| data.into_bytes())
+            {
+                let redis_operation: RedisOperation = match serde_json::from_slice(&data) {
+                    Ok(op) => op,
+                    Err(e) => {
+                        tracing::error!(err=?e, operation=?data, "Failed to deserialize operation");
+                        continue;
+                    }
                 };
-                keys.extend(results);
-            }
-            Err(e) => {
-                tracing::error!(err = ?e, "Error during scan chunk");
-                break;
-            }
-        }
-    }
-
-    for key in keys.into_iter() {
-        let Ok(Some(data)) = client
-            .hget::<Option<Bytes>, _, _>(key, DATA_FIELD_NAME)
-            .await
-        else {
-            continue;
-        };
-
-        let redis_operation: RedisOperation = match serde_json::from_slice(&data) {
-            Ok(op) => op,
-            Err(e) => {
-                tracing::error!(err=?e, operation=?data, "Failed to deserialize operation");
-                continue;
-            }
-        };
-
-        let state = redis_operation.state.stage.into();
-        match state {
-            OperationState::Queued | OperationState::Running => {
                 let properties =
                     filter_properties(group_by, redis_operation.action_info.platform_properties);
 
-                let (queued_operations, running_operations) =
-                    active_operations.entry(properties).or_default();
-
-                match state {
-                    OperationState::Queued => {
-                        queued_operations.insert(redis_operation.operation_id.into_string())
-                    }
-                    OperationState::Running => {
-                        running_operations.insert(redis_operation.operation_id.into_string())
-                    }
-                    _ => unreachable!(),
-                };
+                let queued_operations = active_operations.entry(properties).or_default();
+                queued_operations.insert(redis_operation.operation_id.into_string());
             }
-            OperationState::PreQueue | OperationState::Complete => {
-                // Not an active operation, so we don't add it.
-            }
+        }
+        if data.cursor == 0 {
+            break;
+        }
+        match client.ft_cursor_read(index_name, data.cursor, None).await {
+            Ok(new_data) => data = new_data,
+            Err(_) => break,
         }
     }
 
@@ -304,9 +372,11 @@ fn operation_manager(
     redis_client: Pool,
     mut operation_channel: Receiver<OperationId>,
     group_by: Vec<PropertyName>,
+    index_name: String,
 ) -> Receiver<(PropertySet, OperationCount)> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let group_by = HashSet::from_iter(group_by);
+    let refresh_interval = Duration::from_secs(120);
     tokio::spawn(async move {
         let mut active_operations = HashMap::new();
         loop {
@@ -314,19 +384,29 @@ fn operation_manager(
                 _ = tx.closed() => {
                     return;
                 }
+                _ = tokio::time::sleep(refresh_interval) => {
+                    // If there were no notifications, then just re-populate.
+                    let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
+                    for (properties, queued) in &new_active_operations {
+                        if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
+                            return;
+                        }
+                    }
+                    active_operations = new_active_operations;
+                }
                 operation_id = operation_channel.recv() => {
                     let Some(operation_id) = operation_id else {
                         return;
                     };
                     if operation_id.is_empty() {
-                        // Initial update for all operations.
-                        active_operations = list_operations(&redis_client, &group_by).await;
-                        for (properties, (queued, _running)) in &active_operations {
-                            let queued_entries = queued.len();
-                            if queued_entries > 0 && tx.send((properties.clone(), queued_entries)).await.is_err() {
+                        // Re-populate with all operations.
+                        let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
+                        for (properties, queued) in &new_active_operations {
+                            if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
                                 return;
                             }
                         }
+                        active_operations = new_active_operations;
                         continue;
                     }
                     let Some(operation) = get_operation(&redis_client, &group_by, &operation_id).await else {
@@ -334,21 +414,15 @@ fn operation_manager(
                     };
                     let mut entry = match active_operations.entry(operation.properties) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry,
-                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry((HashSet::new(), HashSet::new())),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry(HashSet::new()),
                     };
-                    let (queued_operations, running_operations) = entry.get_mut();
+                    let queued_operations = entry.get_mut();
                     let original_size = queued_operations.len();
                     match operation.state {
                         OperationState::Queued => {
-                            running_operations.remove(&operation.operation_id);
                             queued_operations.insert(operation.operation_id);
                         }
-                        OperationState::Running => {
-                            queued_operations.remove(&operation.operation_id);
-                            running_operations.insert(operation.operation_id);
-                        }
-                        OperationState::Complete | OperationState::PreQueue => {
-                            running_operations.remove(&operation.operation_id);
+                        _ => {
                             queued_operations.remove(&operation.operation_id);
                         }
                     }
