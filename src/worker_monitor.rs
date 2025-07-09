@@ -44,7 +44,10 @@ pub(crate) fn monitor_workers(
                 _ = tx.closed() => return,
                 maybe_idle_workers = get_idle_workers(&client, &namespace) => {
                     if let Some(idle_workers) = maybe_idle_workers {
-                        let _ = tx.send(idle_workers).await;
+                        tracing::info!(idle_workers=?idle_workers, "Idle workers");
+                        if tx.send(idle_workers).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }

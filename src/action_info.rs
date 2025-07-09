@@ -388,6 +388,7 @@ fn operation_manager(
                     // If there were no notifications, then just re-populate.
                     let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
                     for (properties, queued) in &new_active_operations {
+                        tracing::info!(queue=queued.len(), properties=?properties, "Refreshed queue");
                         if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
                             return;
                         }
@@ -402,6 +403,7 @@ fn operation_manager(
                         // Re-populate with all operations.
                         let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
                         for (properties, queued) in &new_active_operations {
+                            tracing::info!(queue=queued.len(), properties=?properties, "Refreshed queue");
                             if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
                                 return;
                             }

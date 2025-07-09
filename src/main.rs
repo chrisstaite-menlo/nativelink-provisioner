@@ -114,6 +114,45 @@ async fn get_worker_pods(
         .collect()
 }
 
+async fn enumerate_existing_workers(pods: &Api<Pod>) -> WorkerMap {
+    let pod_list = match pods.list(&ListParams::default()).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::error!(err = ?e, "Failed to list pods");
+            return WorkerMap::new();
+        }
+    };
+
+    let container_pods = pod_list.into_iter().filter_map(|pod| {
+        let name = pod.name_any();
+        let container = pod
+            .spec?
+            .containers
+            .into_iter()
+            .next()?
+            .env?
+            .into_iter()
+            .find(|var| var.name == CONTAINER_PROPERTY_ENVIRONMENT_NAME)?
+            .value?;
+        Some((container, name))
+    });
+
+    let mut worker_map = WorkerMap::new();
+    for (container, name) in container_pods {
+        let properties =
+            action_info::PropertySet::from([(CONTAINER_IMAGE_PROPERTY.to_string(), container)]);
+        match worker_map.entry(properties) {
+            std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
+                occupied_entry.get_mut().1.insert(name, Instant::now());
+            }
+            std::collections::hash_map::Entry::Vacant(vacant_entry) => {
+                vacant_entry.insert((0, HashMap::from([(name, Instant::now())])));
+            }
+        }
+    }
+    worker_map
+}
+
 struct WorkerManager {
     namespace: String,
     scale_info: ScaleInfo,
@@ -156,12 +195,14 @@ impl WorkerManager {
 
         let watcher = Box::pin(kube::runtime::watcher(pods.clone(), Default::default()));
 
+        let workers = enumerate_existing_workers(&pods).await;
+
         Ok(Self {
             namespace,
             scale_info,
             pods,
             pod_spec,
-            workers: WorkerMap::new(),
+            workers,
             idle_worker,
             operations_change,
             watcher,
