@@ -393,6 +393,15 @@ fn operation_manager(
                             return;
                         }
                     }
+                    // Check for any now zero length queues.
+                    for properties in active_operations.keys() {
+                        if !new_active_operations.contains_key(properties) {
+                            tracing::info!(queue=0, properties=?properties, "Refreshed queue");
+                            if tx.send((properties.clone(), 0)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
                     active_operations = new_active_operations;
                 }
                 operation_id = operation_channel.recv() => {
@@ -406,6 +415,15 @@ fn operation_manager(
                             tracing::info!(queue=queued.len(), properties=?properties, "Refreshed queue");
                             if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
                                 return;
+                            }
+                        }
+                        // Check for any now zero length queues.
+                        for properties in active_operations.keys() {
+                            if !new_active_operations.contains_key(properties) {
+                                tracing::info!(queue=0, properties=?properties, "Refreshed queue");
+                                if tx.send((properties.clone(), 0)).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                         active_operations = new_active_operations;
