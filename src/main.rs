@@ -137,18 +137,6 @@ impl PropertyWorkers {
         }
     }
 
-    fn should_scale_down_base_worker(&self, name: &worker_monitor::WorkerName) -> bool {
-        !self.base_worker_required()
-            && self
-                .base_worker
-                .as_ref()
-                .is_some_and(|base_worker| base_worker == name)
-    }
-
-    fn clear_base_worker(&mut self) {
-        self.base_worker = None
-    }
-
     fn get_queue_size(&self) -> usize {
         self.queue_size
     }
@@ -503,16 +491,15 @@ impl WorkerManager {
     async fn maybe_scale_down(&mut self, idle_workers: HashSet<worker_monitor::WorkerName>) {
         for idle_worker_name in idle_workers {
             for (_key, property_workers) in self.workers.iter_mut() {
-                if property_workers.should_scale_down_base_worker(&idle_worker_name) {
+                if !property_workers.base_worker_required() && property_workers.remove_base_worker(&idle_worker_name) {
                     // Scale down the base worker.
                     if let Err(err) = self
                         .pods
                         .delete(&idle_worker_name, &Default::default())
                         .await
                     {
+                        property_workers.set_base_worker(idle_worker_name.clone());
                         tracing::error!(err=?err, "There was an error deleting a container");
-                    } else {
-                        property_workers.clear_base_worker();
                     }
                     break;
                 }
