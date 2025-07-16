@@ -124,6 +124,19 @@ impl PropertyWorkers {
         }
     }
 
+    fn remove_base_worker(&mut self, name: &worker_monitor::WorkerName) -> bool {
+        if self
+            .base_worker
+            .as_ref()
+            .is_some_and(|base_name| base_name == name)
+        {
+            self.base_worker = None;
+            true
+        } else {
+            false
+        }
+    }
+
     fn should_scale_down_base_worker(&self, name: &worker_monitor::WorkerName) -> bool {
         !self.base_worker_required()
             && self
@@ -555,7 +568,9 @@ impl WorkerManager {
         let pod_name = pod.name_any();
         let mut deleted = None;
         for (properties, property_workers) in self.workers.iter_mut() {
-            if property_workers.remove_worker(&pod_name).is_some() {
+            if property_workers.remove_worker(&pod_name).is_some()
+                || property_workers.remove_base_worker(&pod_name)
+            {
                 tracing::info!(phase = status.phase, "Worker stopped running: {}", pod_name);
                 let _ = self.pods.delete(&pod_name, &Default::default()).await;
                 deleted = Some((properties.clone(), property_workers.get_queue_size()));
