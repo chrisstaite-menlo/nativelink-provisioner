@@ -28,8 +28,6 @@ struct Config {
     pub_sub_channel: String,
     /// The Kubernetes namespace to spawn workers into.
     namespace: Option<String>,
-    /// The URL of the prometheus frontend to poll for idle workers.
-    prometheus_url: String,
     /// How often to check for idle workers.
     #[serde(with = "humantime_serde")]
     poll_frequency: Duration,
@@ -291,12 +289,14 @@ impl WorkerManager {
             minimum_age: config.minimum_age,
         };
         // Read pods in the configured namespace into the typed interface from k8s-openapi
-        let pods: Api<Pod> = Api::namespaced(kube_client, &namespace);
+        let pods: Api<Pod> = Api::namespaced(kube_client.clone(), &namespace);
 
         // A background task to monitor for idle workers and scale them down.
-        let prom_client = prometheus_http_query::Client::try_from(config.prometheus_url.as_str())?;
-        let idle_worker =
-            worker_monitor::monitor_workers(prom_client, namespace.clone(), config.poll_frequency);
+        let idle_worker = worker_monitor::monitor_workers(
+            kube_client,
+            namespace.clone(),
+            config.poll_frequency,
+        );
 
         // Monitor for operations in the Redis scheduler.
         let operations_change = action_info::monitor_operations(

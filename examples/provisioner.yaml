@@ -4,11 +4,13 @@ data:
     {
       "redis_address": "redis://dev-1-redis-headless:26379/0?sentinelServiceName=mymaster",
       "pub_sub_channel": "scheduler_key_change",
-      "prometheus_url": "http://dev-1-nativelink-prom-frontend:9090",
       "poll_frequency": "60s",
       "minimum_age": "120s",
       "max_pods": 16,
-      "queue_per_pod": 64
+      "queue_per_cpu": 4,
+      "base_worker_cpu": 2,
+      "memory_to_cpu": 2,
+      "worker_cpu": 16
     }
   worker-spec.json: |-
     {
@@ -296,94 +298,21 @@ metadata:
   name: worker-provisioner-rolebinding
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: cluster-admin
+  kind: Role
+  name: worker-provisioner
 subjects:
   - kind: ServiceAccount
     name: nativelink
 
 ---
-apiVersion: v1
-kind: Service
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
 metadata:
-  name: dev-1-nativelink-prom-frontend
-  labels:
-    app.kubernetes.io/name: nativelink
-    app.kubernetes.io/instance: dev-1
-spec:
-  type: ClusterIP
-  ports:
-    - name: web
-      port: 9090
-      targetPort: 9090
-      protocol: TCP
-  selector:
-    app.kubernetes.io/component: metrics-frontend
-    app.kubernetes.io/name: nativelink
-    app.kubernetes.io/instance: dev-1
-
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  labels:
-    app.kubernetes.io/component: metrics-frontend
-    app.kubernetes.io/name: nativelink
-    app.kubernetes.io/instance: dev-1
-  name: dev-1-nativelink-prom-frontend
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/component: metrics-frontend
-      app.kubernetes.io/name: nativelink
-      app.kubernetes.io/instance: dev-1
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/component: metrics-frontend
-        app.kubernetes.io/name: nativelink
-        app.kubernetes.io/instance: dev-1
-    spec:
-      automountServiceAccountToken: true
-      serviceAccount: nativelink
-      affinity:
-        nodeAffinity:
-          requiredDuringSchedulingIgnoredDuringExecution:
-            nodeSelectorTerms:
-            - matchExpressions:
-              - key: kubernetes.io/arch
-                operator: In
-                values:
-                - arm64
-                - amd64
-              - key: kubernetes.io/os
-                operator: In
-                values:
-                - linux
-      containers:
-      - name: dev-1-nativelink-prom-frontend
-        image: gke.gcr.io/prometheus-engine/frontend:v0.15.3-gke.0
-        args:
-        - "--web.listen-address=:9090"
-        - "--query.project-id=<PROJECT_ID>"
-        ports:
-        - name: web
-          containerPort: 9090
-        readinessProbe:
-          httpGet:
-            path: /-/ready
-            port: web
-        securityContext:
-          allowPrivilegeEscalation: false
-          capabilities:
-            drop:
-            - all
-          privileged: false
-          runAsGroup: 1000
-          runAsNonRoot: true
-          runAsUser: 1000
-        livenessProbe:
-          httpGet:
-            path: /-/healthy
-            port: web
+  name: worker-provisioner
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list", "watch"]

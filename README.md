@@ -15,6 +15,5 @@ SOURCE_IMAGE=$(echo "$IMAGE_INFO" | sed 's/Loaded image: //')
 
 An example Kubernetes deployment is available in the examples directory.
 
-Note that you will need to update the project ID for the prometheus frontend
-to match your GCP project ID and also update the image in the deployment to
-match where the built image above is.
+Note that you will need to update update the image in the deployment to match
+where the built image above is.
