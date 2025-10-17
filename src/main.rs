@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::num::NonZeroUsize;
@@ -6,7 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use k8s_openapi::api::core::v1::{EnvVar, Pod};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{Api, ListParams, PostParams};
@@ -18,7 +18,6 @@ use serde::Deserialize;
 use tokio::sync::mpsc::Receiver;
 
 mod action_info;
-mod worker_monitor;
 
 #[derive(Deserialize)]
 struct Config {
@@ -28,12 +27,6 @@ struct Config {
     pub_sub_channel: String,
     /// The Kubernetes namespace to spawn workers into.
     namespace: Option<String>,
-    /// How often to check for idle workers.
-    #[serde(with = "humantime_serde")]
-    poll_frequency: Duration,
-    /// Minimum age of a worker before scaling it down.
-    #[serde(with = "humantime_serde")]
-    minimum_age: Duration,
     /// The maximum number of instances per container image, this does not
     /// include the base worker.
     max_pods: NonZeroUsize,
@@ -52,13 +45,24 @@ const DOCKER_IMAGE_PREFIX: &str = "docker://";
 const CONTAINER_IMAGE_PROPERTY: &str = "container-image";
 const CONTAINER_PROPERTY_ENVIRONMENT_NAME: &str = "PP_CONTAINER_IMAGE";
 const CPU_ENVIRONMENT_NAME: &str = "PP_CPU";
+// Keep a base worker laying around for up to two days before getting rid of it.
 const BASE_WORKER_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 2);
+// Keep a worker for this long to de-bounce queue going up and down.
+const SCALE_DEBOUNCE: Duration = Duration::from_secs(90);
+
+type WorkerName = String;
+
+#[derive(Clone, Debug)]
+struct WorkerInfo {
+    start_time: Instant,
+    death_time: Option<Instant>,
+}
 
 #[derive(Debug)]
 struct PropertyWorkers {
     queue_size: usize,
-    workers: HashMap<worker_monitor::WorkerName, Instant>,
-    base_worker: Option<worker_monitor::WorkerName>,
+    workers: HashMap<WorkerName, WorkerInfo>,
+    base_worker: Option<WorkerName>,
     last_queue_update: Instant,
 }
 
@@ -67,10 +71,7 @@ impl PropertyWorkers {
         Self::new_with_workers(0, HashMap::new())
     }
 
-    fn new_with_workers(
-        queue_size: usize,
-        workers: HashMap<worker_monitor::WorkerName, Instant>,
-    ) -> Self {
+    fn new_with_workers(queue_size: usize, workers: HashMap<WorkerName, WorkerInfo>) -> Self {
         Self {
             queue_size,
             workers,
@@ -79,19 +80,28 @@ impl PropertyWorkers {
         }
     }
 
-    fn add_worker(&mut self, name: worker_monitor::WorkerName) {
+    fn add_worker(&mut self, name: WorkerName) {
         self.add_worker_with_time(name, Instant::now());
     }
 
-    fn add_worker_with_time(&mut self, name: worker_monitor::WorkerName, time: Instant) {
-        self.workers.insert(name, time);
+    fn add_worker_with_info(&mut self, name: WorkerName, info: WorkerInfo) {
+        self.workers.insert(name, info);
     }
 
-    fn remove_worker(
-        &mut self,
-        name: &worker_monitor::WorkerName,
-    ) -> Option<(worker_monitor::WorkerName, Instant)> {
-        self.workers.remove_entry(name)
+    fn add_worker_with_time(&mut self, name: WorkerName, time: Instant) {
+        self.add_worker_with_info(
+            name,
+            WorkerInfo {
+                start_time: time,
+                death_time: None,
+            },
+        );
+    }
+
+    fn remove_worker(&mut self, name: &WorkerName) -> Option<(WorkerName, Instant)> {
+        self.workers
+            .remove_entry(name)
+            .map(|(name, info)| (name, info.start_time))
     }
 
     fn update_queue(&mut self, queue_size: usize) {
@@ -113,7 +123,7 @@ impl PropertyWorkers {
         self.workers.len()
     }
 
-    fn set_base_worker(&mut self, name: worker_monitor::WorkerName) -> bool {
+    fn set_base_worker(&mut self, name: WorkerName) -> bool {
         if self.base_worker.is_none() {
             self.base_worker = Some(name);
             true
@@ -122,17 +132,66 @@ impl PropertyWorkers {
         }
     }
 
-    fn remove_base_worker(&mut self, name: &worker_monitor::WorkerName) -> bool {
+    fn remove_base_worker(&mut self) -> Option<WorkerName> {
+        (!self.base_worker_required())
+            .then(|| self.base_worker.take())
+            .flatten()
+    }
+
+    fn remove_if_base_worker(&mut self, worker_name: &WorkerName) -> bool {
         if self
             .base_worker
             .as_ref()
-            .is_some_and(|base_name| base_name == name)
+            .is_some_and(|base_worker| base_worker == worker_name)
         {
-            self.base_worker = None;
-            true
+            self.base_worker.take().is_some()
         } else {
             false
         }
+    }
+
+    fn scale_down_to(&mut self, workers: usize) -> Vec<(WorkerName, WorkerInfo)> {
+        if self.workers.len() <= workers {
+            return Vec::new();
+        }
+        let to_remove = self.workers.len() - workers;
+        let mut all_workers: Vec<_> = self.workers.iter().collect();
+        all_workers.sort_by(|a, b| b.1.start_time.cmp(&a.1.start_time));
+        let keep_names: Vec<_> = all_workers
+            .iter()
+            .skip(to_remove)
+            .filter_map(|(name, info)| info.death_time.is_some().then_some((*name).clone()))
+            .collect();
+        all_workers.truncate(to_remove);
+        let now: Instant = Instant::now();
+        let (to_add_death_time, workers_to_remove): (Vec<_>, Vec<_>) = all_workers
+            .into_iter()
+            .partition(|(_name, info)| info.death_time.is_none_or(|death_time| death_time >= now));
+        let death_names: Vec<_> = to_add_death_time
+            .into_iter()
+            .filter_map(|(name, info)| info.death_time.is_none().then_some((*name).clone()))
+            .collect();
+        let removed_workers: Vec<_> = workers_to_remove
+            .into_iter()
+            .map(|(name, _info)| name.clone())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|name| self.workers.remove_entry(&name))
+            .collect();
+        // De-bounce scaling.
+        for name in death_names {
+            if let Some(info) = self.workers.get_mut(&name) {
+                tracing::info!("Planning to scale down {name} in {SCALE_DEBOUNCE:?}");
+                info.death_time = Some(now + SCALE_DEBOUNCE);
+            }
+        }
+        for name in keep_names {
+            if let Some(info) = self.workers.get_mut(&name) {
+                tracing::info!("Now going to keep {name}");
+                info.death_time = None;
+            }
+        }
+        removed_workers
     }
 
     fn get_queue_size(&self) -> usize {
@@ -147,7 +206,6 @@ struct ScaleInfo {
     queue_per_cpu: usize,
     base_worker_cpu: usize,
     worker_cpu: usize,
-    minimum_age: Duration,
 }
 
 impl ScaleInfo {
@@ -161,24 +219,12 @@ impl ScaleInfo {
         };
         std::cmp::min(required_workers, self.max_pods)
     }
-
-    fn should_scale_down(
-        &self,
-        start_time: &Instant,
-        current_workers: usize,
-        queue_size: usize,
-    ) -> bool {
-        let minimum_uptime = *start_time + self.minimum_age;
-        let now = Instant::now();
-        let required_workers = self.required_workers(queue_size);
-        minimum_uptime < now && required_workers < current_workers
-    }
 }
 
 async fn get_worker_pods(
     pods: &Api<Pod>,
     properties: &action_info::PropertySet,
-) -> HashMap<worker_monitor::WorkerName, Instant> {
+) -> HashMap<WorkerName, WorkerInfo> {
     let Some(image_name) = properties.get(CONTAINER_IMAGE_PROPERTY) else {
         return HashMap::new();
     };
@@ -206,7 +252,15 @@ async fn get_worker_pods(
                         .is_some_and(|found_image| found_image == image)
                 })
                 .then(|| pod.metadata.name.clone())?
-                .map(|name| (name, Instant::now()))
+                .map(|name| {
+                    (
+                        name,
+                        WorkerInfo {
+                            start_time: Instant::now(),
+                            death_time: None,
+                        },
+                    )
+                })
         })
         .collect()
 }
@@ -265,7 +319,6 @@ struct WorkerManager {
     pods: Api<Pod>,
     pod_spec: Pod,
     workers: WorkerMap,
-    idle_worker: Receiver<HashSet<String>>,
     operations_change: Receiver<(action_info::PropertySet, action_info::OperationCount)>,
     watcher: Pin<Box<dyn Stream<Item = kube::runtime::watcher::Result<Event<Pod>>>>>,
     memory_to_cpu: usize,
@@ -286,17 +339,9 @@ impl WorkerManager {
             queue_per_cpu: config.queue_per_cpu.get(),
             base_worker_cpu: config.base_worker_cpu,
             worker_cpu: config.worker_cpu.get(),
-            minimum_age: config.minimum_age,
         };
         // Read pods in the configured namespace into the typed interface from k8s-openapi
         let pods: Api<Pod> = Api::namespaced(kube_client.clone(), &namespace);
-
-        // A background task to monitor for idle workers and scale them down.
-        let idle_worker = worker_monitor::monitor_workers(
-            kube_client,
-            namespace.clone(),
-            config.poll_frequency,
-        );
 
         // Monitor for operations in the Redis scheduler.
         let operations_change = action_info::monitor_operations(
@@ -316,7 +361,6 @@ impl WorkerManager {
             pods,
             pod_spec,
             workers,
-            idle_worker,
             operations_change,
             watcher,
             memory_to_cpu: config.memory_to_cpu.get(),
@@ -437,17 +481,15 @@ impl WorkerManager {
                     self.base_worker_cpu * self.memory_to_cpu,
                 );
 
-                tracing::info!(
-                    queue = queue_size,
-                    workers = property_workers.workers_count(),
-                    properties = ?properties,
-                    "Scaling up a new base worker"
-                );
                 match self.pods.create(&PostParams::default(), &this_pod).await {
                     Ok(pod) => {
                         if !property_workers.set_base_worker(pod.name_any()) {
                             // This should never happen, but clean up in case.
                             let name = pod.name_any();
+                            tracing::info!(
+                                properties = ?properties,
+                                "Scaled a new base worker {name}"
+                            );
                             if let Err(err) = self.pods.delete(&name, &Default::default()).await {
                                 tracing::error!(err=?err, "There was an error deleting a container {name}");
                             }
@@ -466,16 +508,15 @@ impl WorkerManager {
                     self.worker_cpu,
                     self.worker_cpu * self.memory_to_cpu,
                 );
-
-                tracing::info!(
-                    queue = queue_size,
-                    workers = property_workers.workers_count(),
-                    properties = ?properties,
-                    "Scaling up a new worker"
-                );
                 match self.pods.create(&PostParams::default(), &this_pod).await {
                     Ok(pod) => {
                         property_workers.add_worker(pod.name_any());
+                        tracing::info!(
+                            queue = queue_size,
+                            workers = property_workers.workers_count(),
+                            properties = ?properties,
+                            "Scaling up a new worker {}", pod.name_any()
+                        );
                     }
                     Err(err) => {
                         tracing::error!(err=?err, "There was an error creating a container");
@@ -483,62 +524,41 @@ impl WorkerManager {
                     }
                 }
             }
-
-            tracing::info!(workers=?self.workers, "Scaled up new workers");
         }
     }
 
-    async fn maybe_scale_down(&mut self, idle_workers: HashSet<worker_monitor::WorkerName>) {
-        for idle_worker_name in idle_workers {
-            for (_key, property_workers) in self.workers.iter_mut() {
-                if !property_workers.base_worker_required() && property_workers.remove_base_worker(&idle_worker_name) {
-                    // Scale down the base worker.
-                    if let Err(err) = self
-                        .pods
-                        .delete(&idle_worker_name, &Default::default())
-                        .await
-                    {
-                        property_workers.set_base_worker(idle_worker_name.clone());
-                        tracing::error!(err=?err, "There was an error deleting a container");
-                    }
-                    break;
+    async fn maybe_scale_down(&mut self) -> bool {
+        let mut schedule_scale_down = false;
+        for (_key, property_workers) in self.workers.iter_mut() {
+            if let Some(base_worker) = property_workers.remove_base_worker() {
+                // Scale down the base worker.
+                if let Err(err) = self.pods.delete(&base_worker, &Default::default()).await {
+                    property_workers.set_base_worker(base_worker);
+                    tracing::error!(err=?err, "There was an error deleting a container");
                 }
+            }
 
-                let Some((name, start_time)) = property_workers.remove_worker(&idle_worker_name)
-                else {
-                    // Worker isn't for this property set, carry on.
-                    continue;
-                };
-
-                // Leave workers if they're still required for the queue.
-                if !self.scale_info.should_scale_down(
-                    &start_time,
-                    property_workers.workers_count() + 1,
-                    property_workers.get_queue_size(),
-                ) {
-                    tracing::info!(
-                        queue_size = property_workers.get_queue_size(),
-                        workers = property_workers.workers_count() + 1,
-                        "Not scaling down worker {name} yet."
-                    );
-                    property_workers.add_worker_with_time(name, start_time);
-                } else {
-                    // Try to delete the worker.
-                    tracing::info!(
-                        queue = property_workers.get_queue_size(),
-                        workers = property_workers.workers_count() + 1,
-                        "Scaling down worker {idle_worker_name}"
-                    );
-                    if let Err(err) = self.pods.delete(&name, &Default::default()).await {
-                        tracing::error!(err=?err, "There was an error deleting a container");
-                        property_workers.add_worker_with_time(name, start_time);
-                    }
+            let required_workers = self
+                .scale_info
+                .required_workers(property_workers.get_queue_size());
+            for (worker_name, worker_info) in property_workers.scale_down_to(required_workers) {
+                // Try to delete the worker.
+                tracing::info!(
+                    queue = property_workers.get_queue_size(),
+                    workers = property_workers.workers_count() + 1,
+                    "Scaling down worker {worker_name}"
+                );
+                if let Err(err) = self.pods.delete(&worker_name, &Default::default()).await {
+                    tracing::error!(err=?err, "There was an error deleting a container");
+                    property_workers.add_worker_with_info(worker_name, worker_info);
                 }
+            }
 
-                // Workers are unique to each property set, so exit the loop.
-                break;
+            if property_workers.workers_count() > required_workers {
+                schedule_scale_down = true;
             }
         }
+        schedule_scale_down
     }
 
     async fn handle_pod_notification(&mut self, pod: Pod) {
@@ -556,7 +576,7 @@ impl WorkerManager {
         let mut deleted = None;
         for (properties, property_workers) in self.workers.iter_mut() {
             if property_workers.remove_worker(&pod_name).is_some()
-                || property_workers.remove_base_worker(&pod_name)
+                || property_workers.remove_if_base_worker(&pod_name)
             {
                 tracing::info!(phase = status.phase, "Worker stopped running: {}", pod_name);
                 let _ = self.pods.delete(&pod_name, &Default::default()).await;
@@ -610,6 +630,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Wait for there to be a queue or an idle worker.
     tracing::info!("Monitoring queue to scale workers");
     let mut manager = WorkerManager::new(kube_client.clone(), config, pod_spec, namespace).await?;
+    let mut scale_down_retry = None;
     loop {
         tokio::select! {
             maybe_changed_config = config_changed.recv() => {
@@ -650,19 +671,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     kube::runtime::watcher::Event::Init | kube::runtime::watcher::Event::InitDone => (),
                 }
             }
-            idle_workers = manager.idle_worker.recv() => {
-                let Some(idle_workers) = idle_workers else {
-                    tracing::error!("Idle worker check failed");
-                    break;
-                };
-                manager.maybe_scale_down(idle_workers).await;
-            }
             worker_queue = manager.operations_change.recv() => {
                 let Some((properties, queue_size)) = worker_queue else {
                     tracing::error!("Worker queue check failed");
                     break;
                 };
                 manager.maybe_scale_up(properties, queue_size).await;
+                scale_down_retry = manager.maybe_scale_down().await.then_some(Duration::from_secs(10));
+            }
+            () = scale_down_retry.map_or(core::future::pending().left_future(), |duration| tokio::time::sleep(duration).right_future()) => {
+                scale_down_retry = manager.maybe_scale_down().await.then_some(Duration::from_secs(10));
             }
         }
     }

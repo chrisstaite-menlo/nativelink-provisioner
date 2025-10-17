@@ -4,8 +4,6 @@ data:
     {
       "redis_address": "redis://dev-1-redis-headless:26379/0?sentinelServiceName=mymaster",
       "pub_sub_channel": "scheduler_key_change",
-      "poll_frequency": "60s",
-      "minimum_age": "120s",
       "max_pods": 16,
       "queue_per_cpu": 4,
       "base_worker_cpu": 2,
