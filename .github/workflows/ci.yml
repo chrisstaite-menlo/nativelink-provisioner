@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build Docker image with Nix
+        id: build-image
+        run: |
+          set -euo pipefail
+          # The nix-build command creates a docker image tarball, which we load.
+          # We then capture the image name from the 'docker load' output.
+          image_info=$(docker load < $(nix-build -A image default.nix) | tail -n1)
+          source_image=$(echo "$image_info" | sed 's/Loaded image: //')
+          echo "image_name=$source_image" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag and push image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          SOURCE_IMAGE="${{ steps.build-image.outputs.image_name }}"
+          # The target image name is ghcr.io/OWNER/REPO:tag
+          # We'll use 'latest' and the commit SHA as tags.
+          # Note: github.repository is already in owner/repo format.
+          TARGET_IMAGE_LOWER=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+
+          echo "Tagging $SOURCE_IMAGE as $TARGET_IMAGE_LOWER:latest"
+          docker tag "$SOURCE_IMAGE" "$TARGET_IMAGE_LOWER:latest"
+          docker push "$TARGET_IMAGE_LOWER:latest"
+
+          echo "Tagging $SOURCE_IMAGE as $TARGET_IMAGE_LOWER:${{ github.sha }}"
+          docker tag "$SOURCE_IMAGE" "$TARGET_IMAGE_LOWER:${{ github.sha }}"
+          docker push "$TARGET_IMAGE_LOWER:${{ github.sha }}"
