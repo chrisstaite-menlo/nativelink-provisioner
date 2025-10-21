@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::File;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -29,16 +29,16 @@ struct Config {
     namespace: Option<String>,
     /// The maximum number of instances per container image, this does not
     /// include the base worker.
-    max_pods: NonZeroUsize,
+    max_pods: NonZeroU64,
     /// The number of tasks in the queue per allocated CPU.
-    queue_per_cpu: NonZeroUsize,
+    queue_per_cpu: NonZeroU64,
     /// The number of CPUs to allocate on the base worker, this is a worker
     /// that remains for two days after a property set is used.
-    base_worker_cpu: usize,
+    base_worker_cpu: action_info::OperationCount,
     /// The number of GB of RAM to allocate per CPU allocated to a worker.
-    memory_to_cpu: NonZeroUsize,
+    memory_to_cpu: NonZeroU64,
     /// The number of CPUs to allocate to a standard worker.
-    worker_cpu: NonZeroUsize,
+    worker_cpu: NonZeroU64,
 }
 
 const DOCKER_IMAGE_PREFIX: &str = "docker://";
@@ -60,7 +60,7 @@ struct WorkerInfo {
 
 #[derive(Debug)]
 struct PropertyWorkers {
-    queue_size: usize,
+    queue_size: action_info::OperationCount,
     workers: HashMap<WorkerName, WorkerInfo>,
     base_worker: Option<WorkerName>,
     last_queue_update: Instant,
@@ -71,7 +71,7 @@ impl PropertyWorkers {
         Self::new_with_workers(0, HashMap::new())
     }
 
-    fn new_with_workers(queue_size: usize, workers: HashMap<WorkerName, WorkerInfo>) -> Self {
+    fn new_with_workers(queue_size: action_info::OperationCount, workers: HashMap<WorkerName, WorkerInfo>) -> Self {
         Self {
             queue_size,
             workers,
@@ -104,7 +104,7 @@ impl PropertyWorkers {
             .map(|(name, info)| (name, info.start_time))
     }
 
-    fn update_queue(&mut self, queue_size: usize) {
+    fn update_queue(&mut self, queue_size: action_info::OperationCount) {
         if self.queue_size != 0 || queue_size != 0 {
             self.last_queue_update = Instant::now();
         }
@@ -119,8 +119,8 @@ impl PropertyWorkers {
         self.base_worker.is_none() && self.base_worker_required()
     }
 
-    fn workers_count(&self) -> usize {
-        self.workers.len()
+    fn workers_count(&self) -> action_info::OperationCount {
+        self.workers.len() as u64
     }
 
     fn set_base_worker(&mut self, name: WorkerName) -> bool {
@@ -150,19 +150,19 @@ impl PropertyWorkers {
         }
     }
 
-    fn scale_down_to(&mut self, workers: usize) -> Vec<(WorkerName, WorkerInfo)> {
-        if self.workers.len() <= workers {
+    fn scale_down_to(&mut self, workers: action_info::OperationCount) -> Vec<(WorkerName, WorkerInfo)> {
+        if self.workers_count() <= workers {
             return Vec::new();
         }
-        let to_remove = self.workers.len() - workers;
+        let to_remove = self.workers_count() - workers;
         let mut all_workers: Vec<_> = self.workers.iter().collect();
         all_workers.sort_by(|a, b| b.1.start_time.cmp(&a.1.start_time));
         let keep_names: Vec<_> = all_workers
             .iter()
-            .skip(to_remove)
+            .skip(to_remove as usize)
             .filter_map(|(name, info)| info.death_time.is_some().then_some((*name).clone()))
             .collect();
-        all_workers.truncate(to_remove);
+        all_workers.truncate(to_remove as usize);
         let now: Instant = Instant::now();
         let (to_add_death_time, workers_to_remove): (Vec<_>, Vec<_>) = all_workers
             .into_iter()
@@ -194,7 +194,7 @@ impl PropertyWorkers {
         removed_workers
     }
 
-    fn get_queue_size(&self) -> usize {
+    fn get_queue_size(&self) -> action_info::OperationCount {
         self.queue_size
     }
 }
@@ -202,14 +202,14 @@ impl PropertyWorkers {
 type WorkerMap = HashMap<action_info::PropertySet, PropertyWorkers>;
 
 struct ScaleInfo {
-    max_pods: usize,
-    queue_per_cpu: usize,
-    base_worker_cpu: usize,
-    worker_cpu: usize,
+    max_pods: action_info::OperationCount,
+    queue_per_cpu: action_info::OperationCount,
+    base_worker_cpu: action_info::OperationCount,
+    worker_cpu: action_info::OperationCount,
 }
 
 impl ScaleInfo {
-    fn required_workers(&self, queue_size: usize) -> usize {
+    fn required_workers(&self, queue_size: action_info::OperationCount) -> action_info::OperationCount {
         let base_queue = self.queue_per_cpu * self.base_worker_cpu;
         let required_workers = if queue_size > base_queue {
             let queue_per_pod = self.queue_per_cpu * self.worker_cpu;
@@ -265,7 +265,7 @@ async fn get_worker_pods(
         .collect()
 }
 
-async fn enumerate_existing_workers(pods: &Api<Pod>, base_cpu: usize) -> WorkerMap {
+async fn enumerate_existing_workers(pods: &Api<Pod>, base_cpu: action_info::OperationCount) -> WorkerMap {
     let pod_list = match pods.list(&ListParams::default()).await {
         Ok(list) => list,
         Err(e) => {
@@ -287,7 +287,7 @@ async fn enumerate_existing_workers(pods: &Api<Pod>, base_cpu: usize) -> WorkerM
             .as_ref()
             .and_then(|resources| resources.requests.as_ref())
             .and_then(|requests| requests.get("cpu"))
-            .and_then(|cpu| cpu.0.parse::<usize>().ok())
+            .and_then(|cpu| cpu.0.parse::<action_info::OperationCount>().ok())
             .is_some_and(|request_cpu| request_cpu == base_cpu);
         Some((image_name, name, is_base))
     });
@@ -321,9 +321,9 @@ struct WorkerManager {
     workers: WorkerMap,
     operations_change: Receiver<(action_info::PropertySet, action_info::OperationCount)>,
     watcher: Pin<Box<dyn Stream<Item = kube::runtime::watcher::Result<Event<Pod>>>>>,
-    memory_to_cpu: usize,
-    worker_cpu: usize,
-    base_worker_cpu: usize,
+    memory_to_cpu: action_info::OperationCount,
+    worker_cpu: action_info::OperationCount,
+    base_worker_cpu: action_info::OperationCount,
 }
 
 impl WorkerManager {
@@ -409,7 +409,7 @@ impl WorkerManager {
         None
     }
 
-    fn configure_pod(pod: &Pod, cpu: usize, memory: usize) -> Pod {
+    fn configure_pod(pod: &Pod, cpu: action_info::OperationCount, memory: action_info::OperationCount) -> Pod {
         let mut this_pod = pod.clone();
         // Create a unique name for this pod.
         this_pod.metadata.name = Some(format!(
@@ -453,7 +453,7 @@ impl WorkerManager {
         this_pod
     }
 
-    async fn maybe_scale_up(&mut self, properties: action_info::PropertySet, queue_size: usize) {
+    async fn maybe_scale_up(&mut self, properties: action_info::PropertySet, queue_size: action_info::OperationCount) {
         let mut workers_entry = match self.workers.entry(properties.clone()) {
             std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
                 occupied_entry.get_mut().update_queue(queue_size);

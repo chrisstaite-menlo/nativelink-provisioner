@@ -22,7 +22,7 @@ use tokio::sync::mpsc::Receiver;
 pub(crate) type PropertyName = String;
 pub(crate) type PropertyValue = String;
 pub(crate) type PropertySet = BTreeMap<PropertyName, PropertyValue>;
-pub(crate) type OperationCount = usize;
+pub(crate) type OperationCount = u64;
 type OperationId = String;
 
 /// The name of the field in the Redis hash that stores the data.
@@ -144,7 +144,8 @@ fn monitor_changes(
     rx
 }
 
-type QueuedOperations = HashSet<OperationId>;
+type CpuCount = u64; // This is scaled by 1000.
+type QueuedOperations = HashMap<OperationId, CpuCount>;
 type ActiveOperations = HashMap<PropertySet, QueuedOperations>;
 
 #[derive(Deserialize)]
@@ -193,6 +194,7 @@ struct Operation {
     operation_id: OperationId,
     state: OperationState,
     properties: PropertySet,
+    cpu_count: CpuCount,
 }
 
 impl RedisOperationId {
@@ -254,6 +256,16 @@ impl FromValue for RedisCursorData {
     }
 }
 
+fn get_cpu_count(properties: &HashMap<PropertyName, PropertyValue>) -> CpuCount {
+    properties
+        .get("cpu_count")
+        .and_then(|count| {
+            // Round up to the nearest 1000.
+            count.parse::<u64>().ok().map(|v| v.div_ceil(1000))
+        })
+        .unwrap_or(1)
+}
+
 async fn list_operations(
     redis_client: &Pool,
     group_by: &HashSet<PropertyName>,
@@ -306,11 +318,12 @@ async fn list_operations(
                         continue;
                     }
                 };
+                let cpu_count = get_cpu_count(&redis_operation.action_info.platform_properties);
                 let properties =
                     filter_properties(group_by, redis_operation.action_info.platform_properties);
 
                 let queued_operations = active_operations.entry(properties).or_default();
-                queued_operations.insert(redis_operation.operation_id.into_string());
+                queued_operations.insert(redis_operation.operation_id.into_string(), cpu_count);
             }
         }
         if data.cursor == 0 {
@@ -359,13 +372,19 @@ async fn get_operation(
         .await
         .ok()??;
     let redis_operation: RedisOperation = serde_json::from_slice(&data).ok()?;
+    let cpu_count = get_cpu_count(&redis_operation.action_info.platform_properties);
     let properties = filter_properties(group_by, redis_operation.action_info.platform_properties);
     let state = redis_operation.state.stage.into();
     Some(Operation {
         operation_id: redis_operation.operation_id.into_string(),
         state,
         properties,
+        cpu_count,
     })
+}
+
+fn count_queue(operations: &QueuedOperations) -> u64 {
+    operations.values().sum()
 }
 
 fn operation_manager(
@@ -388,8 +407,9 @@ fn operation_manager(
                     // If there were no notifications, then just re-populate.
                     let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
                     for (properties, queued) in &new_active_operations {
-                        tracing::info!(queue=queued.len(), properties=?properties, "Refreshed queue");
-                        if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
+                        let queue_length = count_queue(queued);
+                        tracing::info!(queue=queue_length, properties=?properties, "Refreshed queue");
+                        if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| count_queue(previously_queued) != queue_length) && tx.send((properties.clone(), queue_length)).await.is_err() {
                             return;
                         }
                     }
@@ -412,8 +432,9 @@ fn operation_manager(
                         // Re-populate with all operations.
                         let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
                         for (properties, queued) in &new_active_operations {
-                            tracing::info!(queue=queued.len(), properties=?properties, "Refreshed queue");
-                            if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| previously_queued.len() != queued.len()) && tx.send((properties.clone(), queued.len())).await.is_err() {
+                            let queue_length = count_queue(queued);
+                            tracing::info!(queue=queue_length, properties=?properties, "Refreshed queue");
+                            if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| count_queue(previously_queued) != queue_length) && tx.send((properties.clone(), queue_length)).await.is_err() {
                                 return;
                             }
                         }
@@ -434,19 +455,19 @@ fn operation_manager(
                     };
                     let mut entry = match active_operations.entry(operation.properties) {
                         std::collections::hash_map::Entry::Occupied(entry) => entry,
-                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry(HashSet::new()),
+                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry(QueuedOperations::new()),
                     };
                     let queued_operations = entry.get_mut();
-                    let original_size = queued_operations.len();
+                    let original_size = count_queue(queued_operations);
                     match operation.state {
                         OperationState::Queued => {
-                            queued_operations.insert(operation.operation_id);
+                            queued_operations.insert(operation.operation_id, operation.cpu_count);
                         }
                         _ => {
                             queued_operations.remove(&operation.operation_id);
                         }
                     }
-                    let new_size = queued_operations.len();
+                    let new_size = count_queue(queued_operations);
                     if new_size != original_size && tx.send((entry.key().clone(), new_size)).await.is_err() {
                         return;
                     }
