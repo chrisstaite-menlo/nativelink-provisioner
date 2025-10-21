@@ -527,14 +527,25 @@ impl WorkerManager {
         }
     }
 
+    fn is_404(error: &kube::Error) -> bool {
+        if let kube::Error::Api(error_response) = &error {
+            if error_response.code == 404 {
+                return true;
+            }
+        }
+        false
+    }
+
     async fn maybe_scale_down(&mut self) -> bool {
         let mut schedule_scale_down = false;
         for (_key, property_workers) in self.workers.iter_mut() {
             if let Some(base_worker) = property_workers.remove_base_worker() {
                 // Scale down the base worker.
                 if let Err(err) = self.pods.delete(&base_worker, &Default::default()).await {
-                    property_workers.set_base_worker(base_worker);
-                    tracing::error!(err=?err, "There was an error deleting a container");
+                    if !Self::is_404(&err) {
+                        property_workers.set_base_worker(base_worker);
+                        tracing::error!(err=?err, "There was an error deleting a container");
+                    }
                 }
             }
 
@@ -549,8 +560,10 @@ impl WorkerManager {
                     "Scaling down worker {worker_name}"
                 );
                 if let Err(err) = self.pods.delete(&worker_name, &Default::default()).await {
-                    tracing::error!(err=?err, "There was an error deleting a container");
-                    property_workers.add_worker_with_info(worker_name, worker_info);
+                    if !Self::is_404(&err) {
+                        tracing::error!(err=?err, "There was an error deleting a container");
+                        property_workers.add_worker_with_info(worker_name, worker_info);
+                    }
                 }
             }
 
