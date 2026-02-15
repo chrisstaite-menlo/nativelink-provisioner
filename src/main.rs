@@ -71,7 +71,10 @@ impl PropertyWorkers {
         Self::new_with_workers(0, HashMap::new())
     }
 
-    fn new_with_workers(queue_size: action_info::OperationCount, workers: HashMap<WorkerName, WorkerInfo>) -> Self {
+    fn new_with_workers(
+        queue_size: action_info::OperationCount,
+        workers: HashMap<WorkerName, WorkerInfo>,
+    ) -> Self {
         Self {
             queue_size,
             workers,
@@ -150,7 +153,10 @@ impl PropertyWorkers {
         }
     }
 
-    fn scale_down_to(&mut self, workers: action_info::OperationCount) -> Vec<(WorkerName, WorkerInfo)> {
+    fn scale_down_to(
+        &mut self,
+        workers: action_info::OperationCount,
+    ) -> Vec<(WorkerName, WorkerInfo)> {
         if self.workers_count() <= workers {
             return Vec::new();
         }
@@ -209,7 +215,10 @@ struct ScaleInfo {
 }
 
 impl ScaleInfo {
-    fn required_workers(&self, queue_size: action_info::OperationCount) -> action_info::OperationCount {
+    fn required_workers(
+        &self,
+        queue_size: action_info::OperationCount,
+    ) -> action_info::OperationCount {
         let base_queue = self.queue_per_cpu * self.base_worker_cpu;
         let required_workers = if queue_size > base_queue {
             let queue_per_pod = self.queue_per_cpu * self.worker_cpu;
@@ -265,7 +274,10 @@ async fn get_worker_pods(
         .collect()
 }
 
-async fn enumerate_existing_workers(pods: &Api<Pod>, base_cpu: action_info::OperationCount) -> WorkerMap {
+async fn enumerate_existing_workers(
+    pods: &Api<Pod>,
+    base_cpu: action_info::OperationCount,
+) -> WorkerMap {
     let pod_list = match pods.list(&ListParams::default()).await {
         Ok(list) => list,
         Err(e) => {
@@ -409,7 +421,11 @@ impl WorkerManager {
         None
     }
 
-    fn configure_pod(pod: &Pod, cpu: action_info::OperationCount, memory: action_info::OperationCount) -> Pod {
+    fn configure_pod(
+        pod: &Pod,
+        cpu: action_info::OperationCount,
+        memory: action_info::OperationCount,
+    ) -> Pod {
         let mut this_pod = pod.clone();
         // Create a unique name for this pod.
         this_pod.metadata.name = Some(format!(
@@ -453,7 +469,11 @@ impl WorkerManager {
         this_pod
     }
 
-    async fn maybe_scale_up(&mut self, properties: action_info::PropertySet, queue_size: action_info::OperationCount) {
+    async fn maybe_scale_up(
+        &mut self,
+        properties: action_info::PropertySet,
+        queue_size: action_info::OperationCount,
+    ) {
         let mut workers_entry = match self.workers.entry(properties.clone()) {
             std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
                 occupied_entry.get_mut().update_queue(queue_size);
@@ -528,10 +548,10 @@ impl WorkerManager {
     }
 
     fn is_404(error: &kube::Error) -> bool {
-        if let kube::Error::Api(error_response) = &error {
-            if error_response.code == 404 {
-                return true;
-            }
+        if let kube::Error::Api(error_response) = &error
+            && error_response.code == 404
+        {
+            return true;
         }
         false
     }
@@ -539,14 +559,12 @@ impl WorkerManager {
     async fn maybe_scale_down(&mut self) -> bool {
         let mut schedule_scale_down = false;
         for (_key, property_workers) in self.workers.iter_mut() {
-            if let Some(base_worker) = property_workers.remove_base_worker() {
-                // Scale down the base worker.
-                if let Err(err) = self.pods.delete(&base_worker, &Default::default()).await {
-                    if !Self::is_404(&err) {
-                        property_workers.set_base_worker(base_worker);
-                        tracing::error!(err=?err, "There was an error deleting a container");
-                    }
-                }
+            if let Some(base_worker) = property_workers.remove_base_worker()
+                && let Err(err) = self.pods.delete(&base_worker, &Default::default()).await
+                && !Self::is_404(&err)
+            {
+                property_workers.set_base_worker(base_worker);
+                tracing::error!(err=?err, "There was an error deleting a container");
             }
 
             let required_workers = self
@@ -559,11 +577,11 @@ impl WorkerManager {
                     workers = property_workers.workers_count() + 1,
                     "Scaling down worker {worker_name}"
                 );
-                if let Err(err) = self.pods.delete(&worker_name, &Default::default()).await {
-                    if !Self::is_404(&err) {
-                        tracing::error!(err=?err, "There was an error deleting a container");
-                        property_workers.add_worker_with_info(worker_name, worker_info);
-                    }
+                if let Err(err) = self.pods.delete(&worker_name, &Default::default()).await
+                    && !Self::is_404(&err)
+                {
+                    tracing::error!(err=?err, "There was an error deleting a container");
+                    property_workers.add_worker_with_info(worker_name, worker_info);
                 }
             }
 

@@ -2,7 +2,7 @@
 // the number of jobs that are active for a given set of platform properties.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::{Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
 use fred::clients::{Pool, SubscriberClient};
@@ -12,9 +12,7 @@ use fred::prelude::{
     PubsubInterface, ReconnectPolicy, RediSearchInterface,
 };
 use fred::types::config::{Config, UnresponsiveConfig};
-use fred::types::redisearch::{
-    FtAggregateOptions, Load, SearchField, WithCursor,
-};
+use fred::types::redisearch::{FtAggregateOptions, Load, SearchField, WithCursor};
 use fred::types::{Builder, FromValue, Key, Map, Value};
 use futures::FutureExt;
 use serde::Deserialize;
@@ -279,12 +277,10 @@ async fn list_operations(
             index_name,
             "@state:{ queued }",
             FtAggregateOptions {
-                load: Some(Load::Some(vec![
-                    SearchField {
-                        identifier: DATA_FIELD_NAME.into(),
-                        property: None,
-                    },
-                ])),
+                load: Some(Load::Some(vec![SearchField {
+                    identifier: DATA_FIELD_NAME.into(),
+                    property: None,
+                }])),
                 cursor: Some(WithCursor {
                     count: Some(1000),
                     max_idle: Some(10000),
