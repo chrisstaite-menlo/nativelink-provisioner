@@ -2,7 +2,7 @@
 // the number of jobs that are active for a given set of platform properties.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::time::Duration;
+use std::time::{Duration};
 
 use bytes::Bytes;
 use fred::clients::{Pool, SubscriberClient};
@@ -13,11 +13,13 @@ use fred::prelude::{
 };
 use fred::types::config::{Config, UnresponsiveConfig};
 use fred::types::redisearch::{
-    AggregateOperation, FtAggregateOptions, Load, SearchField, WithCursor,
+    FtAggregateOptions, Load, SearchField, WithCursor,
 };
-use fred::types::{Builder, FromValue, Key, Map, SortOrder, Value};
+use fred::types::{Builder, FromValue, Key, Map, Value};
+use futures::FutureExt;
 use serde::Deserialize;
 use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
 
 pub(crate) type PropertyName = String;
 pub(crate) type PropertyValue = String;
@@ -27,8 +29,6 @@ type OperationId = String;
 
 /// The name of the field in the Redis hash that stores the data.
 const DATA_FIELD_NAME: &str = "data";
-/// The name of the field in the Redis hash that stores the data.
-const VERSION_FIELD_NAME: &str = "version";
 /// The key prefix for an AwaitedAction in Redis.
 const AWAITED_ACTION_PREFIX: &str = "aa_";
 
@@ -85,7 +85,7 @@ fn monitor_changes(
     subscriber_client: SubscriberClient,
     pub_sub_channel: String,
 ) -> Receiver<OperationId> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<OperationId>(1);
+    let (tx, rx) = tokio::sync::mpsc::channel::<OperationId>(1000);
     tokio::spawn(async move {
         let mut rx = subscriber_client.message_rx();
         loop {
@@ -284,19 +284,12 @@ async fn list_operations(
                         identifier: DATA_FIELD_NAME.into(),
                         property: None,
                     },
-                    SearchField {
-                        identifier: VERSION_FIELD_NAME.into(),
-                        property: None,
-                    },
                 ])),
                 cursor: Some(WithCursor {
-                    count: Some(256),
-                    max_idle: Some(2000),
+                    count: Some(1000),
+                    max_idle: Some(10000),
                 }),
-                pipeline: vec![AggregateOperation::SortBy {
-                    properties: vec![("@sort_key".into(), SortOrder::Asc)],
-                    max: None,
-                }],
+                pipeline: vec![],
                 ..Default::default()
             },
         )
@@ -396,6 +389,9 @@ fn operation_manager(
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let group_by = HashSet::from_iter(group_by);
     let refresh_interval = Duration::from_secs(120);
+    let mut operation_ids = HashSet::new();
+    let mut operation_update = None;
+    let mut refresh_operations = false;
     tokio::spawn(async move {
         let mut active_operations = HashMap::new();
         loop {
@@ -429,6 +425,18 @@ fn operation_manager(
                         return;
                     };
                     if operation_id.is_empty() {
+                        refresh_operations = true;
+                    } else {
+                        operation_ids.insert(operation_id);
+                    }
+                    if (!operation_ids.is_empty() || refresh_operations) && operation_update.is_none() {
+                        operation_update = Some(Instant::now() + Duration::from_millis(500));
+                    }
+                }
+                () = operation_update.map_or(core::future::pending().left_future(), |duration| tokio::time::sleep_until(duration).right_future()) => {
+                    operation_update = None;
+                    if refresh_operations {
+                        refresh_operations = false;
                         // Re-populate with all operations.
                         let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
                         for (properties, queued) in &new_active_operations {
@@ -448,28 +456,30 @@ fn operation_manager(
                             }
                         }
                         active_operations = new_active_operations;
-                        continue;
+                        operation_ids.clear();
                     }
-                    let Some(operation) = get_operation(&redis_client, &group_by, &operation_id).await else {
-                        continue;
-                    };
-                    let mut entry = match active_operations.entry(operation.properties) {
-                        std::collections::hash_map::Entry::Occupied(entry) => entry,
-                        std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry(QueuedOperations::new()),
-                    };
-                    let queued_operations = entry.get_mut();
-                    let original_size = count_queue(queued_operations);
-                    match operation.state {
-                        OperationState::Queued => {
-                            queued_operations.insert(operation.operation_id, operation.cpu_count);
+                    for operation_id in operation_ids.drain() {
+                        let Some(operation) = get_operation(&redis_client, &group_by, &operation_id).await else {
+                            continue;
+                        };
+                        let mut entry = match active_operations.entry(operation.properties) {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry,
+                            std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry(QueuedOperations::new()),
+                        };
+                        let queued_operations = entry.get_mut();
+                        let original_size = count_queue(queued_operations);
+                        match operation.state {
+                            OperationState::Queued => {
+                                queued_operations.insert(operation.operation_id, operation.cpu_count);
+                            }
+                            _ => {
+                                queued_operations.remove(&operation.operation_id);
+                            }
                         }
-                        _ => {
-                            queued_operations.remove(&operation.operation_id);
+                        let new_size = count_queue(queued_operations);
+                        if new_size != original_size && tx.send((entry.key().clone(), new_size)).await.is_err() {
+                            return;
                         }
-                    }
-                    let new_size = count_queue(queued_operations);
-                    if new_size != original_size && tx.send((entry.key().clone(), new_size)).await.is_err() {
-                        return;
                     }
                 }
             }
