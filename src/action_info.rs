@@ -400,35 +400,19 @@ fn operation_manager(
                     return;
                 }
                 _ = tokio::time::sleep(refresh_interval) => {
-                    // If there were no notifications, then just re-populate.
-                    let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
-                    for (properties, queued) in &new_active_operations {
-                        let queue_length = count_queue(queued);
-                        tracing::info!(queue=queue_length, properties=?properties, "Refreshed queue");
-                        if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| count_queue(previously_queued) != queue_length) && tx.send((properties.clone(), queue_length)).await.is_err() {
-                            return;
-                        }
+                    refresh_operations = true;
+                    if operation_update.is_none() {
+                        operation_update = Some(Instant::now() + Duration::from_millis(500));
                     }
-                    // Check for any now zero length queues.
-                    for properties in active_operations.keys() {
-                        if !new_active_operations.contains_key(properties) {
-                            tracing::info!(queue=0, properties=?properties, "Refreshed queue");
-                            if tx.send((properties.clone(), 0)).await.is_err() {
-                                return;
-                            }
-                        }
-                    }
-                    active_operations = new_active_operations;
                 }
                 operation_id = operation_channel.recv() => {
-                    let Some(operation_id) = operation_id else {
-                        return;
+                    if let Some(operation_id) = operation_id {
+                        if operation_id.is_empty() {
+                            refresh_operations = true;
+                        } else {
+                            operation_ids.insert(operation_id);
+                        }
                     };
-                    if operation_id.is_empty() {
-                        refresh_operations = true;
-                    } else {
-                        operation_ids.insert(operation_id);
-                    }
                     if (!operation_ids.is_empty() || refresh_operations) && operation_update.is_none() {
                         operation_update = Some(Instant::now() + Duration::from_millis(500));
                     }
