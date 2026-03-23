@@ -109,7 +109,7 @@ fn monitor_changes(
                             // Error receiving message, try to reconnect.
                             break;
                         };
-                        let Value::String(s) = msg.value else {
+                        let Some(s) = msg.value.as_string() else {
                             // We're only interested in string values.
                             continue;
                         };
