@@ -60,7 +60,7 @@ struct WorkerInfo {
 
 #[derive(Debug)]
 struct PropertyWorkers {
-    queue_size: action_info::OperationCount,
+    queue_info: action_info::QueueInfo,
     workers: HashMap<WorkerName, WorkerInfo>,
     base_worker: Option<WorkerName>,
     last_queue_update: Instant,
@@ -68,15 +68,15 @@ struct PropertyWorkers {
 
 impl PropertyWorkers {
     fn new() -> Self {
-        Self::new_with_workers(0, HashMap::new())
+        Self::new_with_workers(action_info::QueueInfo::default(), HashMap::new())
     }
 
     fn new_with_workers(
-        queue_size: action_info::OperationCount,
+        queue_info: action_info::QueueInfo,
         workers: HashMap<WorkerName, WorkerInfo>,
     ) -> Self {
         Self {
-            queue_size,
+            queue_info,
             workers,
             base_worker: None,
             last_queue_update: Instant::now(),
@@ -107,11 +107,11 @@ impl PropertyWorkers {
             .map(|(name, info)| (name, info.start_time))
     }
 
-    fn update_queue(&mut self, queue_size: action_info::OperationCount) {
-        if self.queue_size != 0 || queue_size != 0 {
+    fn update_queue(&mut self, queue_info: action_info::QueueInfo) {
+        if self.queue_info.size != 0 || queue_info.size != 0 {
             self.last_queue_update = Instant::now();
         }
-        self.queue_size = queue_size;
+        self.queue_info = queue_info;
     }
 
     fn base_worker_required(&self) -> bool {
@@ -200,8 +200,8 @@ impl PropertyWorkers {
         removed_workers
     }
 
-    fn get_queue_size(&self) -> action_info::OperationCount {
-        self.queue_size
+    fn get_queue_info(&self) -> action_info::QueueInfo {
+        self.queue_info
     }
 }
 
@@ -215,17 +215,15 @@ struct ScaleInfo {
 }
 
 impl ScaleInfo {
-    fn required_workers(
-        &self,
-        queue_size: action_info::OperationCount,
-    ) -> action_info::OperationCount {
+    fn required_workers(&self, queue_info: action_info::QueueInfo) -> action_info::OperationCount {
         let base_queue = self.queue_per_cpu * self.base_worker_cpu;
-        let required_workers = if queue_size > base_queue {
-            let queue_per_pod = self.queue_per_cpu * self.worker_cpu;
-            std::cmp::max(1, queue_size / queue_per_pod)
-        } else {
-            0
-        };
+        let required_workers =
+            if queue_info.size > base_queue || queue_info.max_cpu > self.base_worker_cpu {
+                let queue_per_pod = self.queue_per_cpu * self.worker_cpu;
+                std::cmp::max(1, queue_info.size / queue_per_pod)
+            } else {
+                0
+            };
         std::cmp::min(required_workers, self.max_pods)
     }
 }
@@ -331,7 +329,7 @@ struct WorkerManager {
     pods: Api<Pod>,
     pod_spec: Pod,
     workers: WorkerMap,
-    operations_change: Receiver<(action_info::PropertySet, action_info::OperationCount)>,
+    operations_change: Receiver<(action_info::PropertySet, action_info::QueueInfo)>,
     watcher: Pin<Box<dyn Stream<Item = kube::runtime::watcher::Result<Event<Pod>>>>>,
     memory_to_cpu: action_info::OperationCount,
     worker_cpu: action_info::OperationCount,
@@ -472,22 +470,22 @@ impl WorkerManager {
     async fn maybe_scale_up(
         &mut self,
         properties: action_info::PropertySet,
-        queue_size: action_info::OperationCount,
+        queue_info: action_info::QueueInfo,
     ) {
         let mut workers_entry = match self.workers.entry(properties.clone()) {
             std::collections::hash_map::Entry::Occupied(mut occupied_entry) => {
-                occupied_entry.get_mut().update_queue(queue_size);
+                occupied_entry.get_mut().update_queue(queue_info);
                 occupied_entry
             }
             std::collections::hash_map::Entry::Vacant(vacant_entry) => {
                 let workers = get_worker_pods(&self.pods, vacant_entry.key()).await;
-                vacant_entry.insert_entry(PropertyWorkers::new_with_workers(queue_size, workers))
+                vacant_entry.insert_entry(PropertyWorkers::new_with_workers(queue_info, workers))
             }
         };
         let property_workers = workers_entry.get_mut();
         let need_base_worker = property_workers.need_base_worker();
 
-        let required_workers = self.scale_info.required_workers(queue_size);
+        let required_workers = self.scale_info.required_workers(queue_info);
         if property_workers.workers_count() >= required_workers && !need_base_worker {
             // No need to scale up.
             return;
@@ -532,7 +530,8 @@ impl WorkerManager {
                     Ok(pod) => {
                         property_workers.add_worker(pod.name_any());
                         tracing::info!(
-                            queue = queue_size,
+                            queue = queue_info.size,
+                            max_cpu = queue_info.max_cpu,
                             workers = property_workers.workers_count(),
                             properties = ?properties,
                             "Scaling up a new worker {}", pod.name_any()
@@ -569,11 +568,11 @@ impl WorkerManager {
 
             let required_workers = self
                 .scale_info
-                .required_workers(property_workers.get_queue_size());
+                .required_workers(property_workers.get_queue_info());
             for (worker_name, worker_info) in property_workers.scale_down_to(required_workers) {
                 // Try to delete the worker.
                 tracing::info!(
-                    queue = property_workers.get_queue_size(),
+                    queue = property_workers.get_queue_info().size,
                     workers = property_workers.workers_count() + 1,
                     "Scaling down worker {worker_name}"
                 );
@@ -611,12 +610,12 @@ impl WorkerManager {
             {
                 tracing::info!(phase = status.phase, "Worker stopped running: {}", pod_name);
                 let _ = self.pods.delete(&pod_name, &Default::default()).await;
-                deleted = Some((properties.clone(), property_workers.get_queue_size()));
+                deleted = Some((properties.clone(), property_workers.get_queue_info()));
                 break;
             }
         }
-        if let Some((properties, queue_size)) = deleted {
-            self.maybe_scale_up(properties, queue_size).await;
+        if let Some((properties, queue_info)) = deleted {
+            self.maybe_scale_up(properties, queue_info).await;
         }
     }
 }
@@ -703,11 +702,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             worker_queue = manager.operations_change.recv() => {
-                let Some((properties, queue_size)) = worker_queue else {
+                let Some((properties, queue_info)) = worker_queue else {
                     tracing::error!("Worker queue check failed");
                     break;
                 };
-                manager.maybe_scale_up(properties, queue_size).await;
+                manager.maybe_scale_up(properties, queue_info).await;
                 scale_down_retry = manager.maybe_scale_down().await.then_some(Duration::from_secs(10));
             }
             () = scale_down_retry.map_or(core::future::pending().left_future(), |duration| tokio::time::sleep(duration).right_future()) => {
