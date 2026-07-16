@@ -23,7 +23,14 @@ pub(crate) type PropertyName = String;
 pub(crate) type PropertyValue = String;
 pub(crate) type PropertySet = BTreeMap<PropertyName, PropertyValue>;
 pub(crate) type OperationCount = u64;
+pub(crate) type CpuCount = u64; // This is scaled by 1000.
 type OperationId = String;
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct QueueInfo {
+    pub size: OperationCount,
+    pub max_cpu: CpuCount,
+}
 
 /// The name of the field in the Redis hash that stores the data.
 const DATA_FIELD_NAME: &str = "data";
@@ -34,7 +41,7 @@ pub(crate) async fn monitor_operations(
     redis_addr: &str,
     pub_sub_channel: String,
     group_by: Vec<PropertyName>,
-) -> Result<Receiver<(PropertySet, OperationCount)>, Error> {
+) -> Result<Receiver<(PropertySet, QueueInfo)>, Error> {
     let redis_config = Config::from_url_sentinel(redis_addr)?;
     let reconnect_policy = ReconnectPolicy::new_exponential(0, 100, 8000, 2);
     let mut builder = Builder::from_config(redis_config);
@@ -142,7 +149,6 @@ fn monitor_changes(
     rx
 }
 
-type CpuCount = u64; // This is scaled by 1000.
 type QueuedOperations = HashMap<OperationId, CpuCount>;
 type ActiveOperations = HashMap<PropertySet, QueuedOperations>;
 
@@ -372,8 +378,11 @@ async fn get_operation(
     })
 }
 
-fn count_queue(operations: &QueuedOperations) -> u64 {
-    operations.values().sum()
+fn count_queue(operations: &QueuedOperations) -> QueueInfo {
+    QueueInfo {
+        size: operations.values().sum(),
+        max_cpu: operations.values().copied().max().unwrap_or(0),
+    }
 }
 
 fn operation_manager(
@@ -381,7 +390,7 @@ fn operation_manager(
     mut operation_channel: Receiver<OperationId>,
     group_by: Vec<PropertyName>,
     index_name: String,
-) -> Receiver<(PropertySet, OperationCount)> {
+) -> Receiver<(PropertySet, QueueInfo)> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let group_by = HashSet::from_iter(group_by);
     let refresh_interval = Duration::from_secs(120);
@@ -420,9 +429,9 @@ fn operation_manager(
                         // Re-populate with all operations.
                         let new_active_operations = list_operations(&redis_client, &group_by, &index_name).await;
                         for (properties, queued) in &new_active_operations {
-                            let queue_length = count_queue(queued);
-                            tracing::info!(queue=queue_length, properties=?properties, "Refreshed queue");
-                            if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| count_queue(previously_queued) != queue_length) && tx.send((properties.clone(), queue_length)).await.is_err() {
+                            let queue_info = count_queue(queued);
+                            tracing::info!(queue=queue_info.size, properties=?properties, "Refreshed queue");
+                            if active_operations.get(properties).is_none_or(|previously_queued: &QueuedOperations| count_queue(previously_queued) != queue_info) && tx.send((properties.clone(), queue_info)).await.is_err() {
                                 return;
                             }
                         }
@@ -430,7 +439,7 @@ fn operation_manager(
                         for properties in active_operations.keys() {
                             if !new_active_operations.contains_key(properties) {
                                 tracing::info!(queue=0, properties=?properties, "Refreshed queue");
-                                if tx.send((properties.clone(), 0)).await.is_err() {
+                                if tx.send((properties.clone(), QueueInfo::default())).await.is_err() {
                                     return;
                                 }
                             }
@@ -447,7 +456,7 @@ fn operation_manager(
                             std::collections::hash_map::Entry::Vacant(entry) => entry.insert_entry(QueuedOperations::new()),
                         };
                         let queued_operations = entry.get_mut();
-                        let original_size = count_queue(queued_operations);
+                        let original_info = count_queue(queued_operations);
                         match operation.state {
                             OperationState::Queued => {
                                 queued_operations.insert(operation.operation_id, operation.cpu_count);
@@ -456,8 +465,8 @@ fn operation_manager(
                                 queued_operations.remove(&operation.operation_id);
                             }
                         }
-                        let new_size = count_queue(queued_operations);
-                        if new_size != original_size && tx.send((entry.key().clone(), new_size)).await.is_err() {
+                        let new_info = count_queue(queued_operations);
+                        if new_info != original_info && tx.send((entry.key().clone(), new_info)).await.is_err() {
                             return;
                         }
                     }
